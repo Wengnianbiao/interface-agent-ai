@@ -12,7 +12,7 @@ export default defineConfig(({ mode }) => ({
     }
   },
   build: {
-    outDir: mode === 'production' ? '../../backend/app/static' : '../dist',
+    outDir: mode === 'production' ? '../backend/app/static' : './dist',
     emptyOutDir: true
   }
 }))
