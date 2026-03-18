@@ -1,9 +1,19 @@
 <script setup>
 import { ref, nextTick, watch } from 'vue'
 
-const API_BASE_URL = ''  // 开发环境使用代理，生产环境直接访问当前域名
+const API_BASE_URL = ''
+const props = defineProps({
+  accessToken: {
+    type: String,
+    default: ''
+  },
+  currentUser: {
+    type: Object,
+    default: null
+  }
+})
+const emit = defineEmits(['logout'])
 
-// 聊天历史
 const messages = ref([])
 const inputPrompt = ref('')
 const isLoading = ref(false)
@@ -26,14 +36,13 @@ const toggleSidebar = () => {
   isSidebarCollapsed.value = !isSidebarCollapsed.value
 }
 
-const buildHistoryPayload = () => {
-  return messages.value
-    .slice(-12)
-    .filter((item) => item?.role && item?.content)
-    .map((item) => ({
-      role: item.role,
-      content: item.content
-    }))
+const logout = () => {
+  messages.value = []
+  inputPrompt.value = ''
+  sessionId.value = (typeof crypto !== 'undefined' && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  emit('logout')
 }
 
 // 滚动到底部
@@ -88,12 +97,12 @@ const sendMessage = async () => {
     const response = await fetch(`${API_BASE_URL}/api/chat`, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        ...(props.accessToken ? { Authorization: `Bearer ${props.accessToken}` } : {})
       },
       body: JSON.stringify({
         prompt: userMessage,
-        sessionId: sessionId.value,
-        history: buildHistoryPayload()
+        sessionId: sessionId.value
       })
     })
     const responseSessionId = response.headers.get('X-Session-Id')
@@ -223,7 +232,7 @@ const copyCode = async (code) => {
   <div class="chat-layout">
     <aside :class="['sidebar', { collapsed: isSidebarCollapsed }]">
       <div class="sidebar-header">
-        <h2 v-show="!isSidebarCollapsed">Interface-Agent AI</h2>
+        <h2 v-show="!isSidebarCollapsed">接口AI助手</h2>
         <button class="sidebar-toggle-btn" @click="toggleSidebar">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
             <path d="M15 18L9 12L15 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -239,83 +248,87 @@ const copyCode = async (code) => {
         </button>
         <div class="chat-history">
         </div>
+        <div v-if="!isSidebarCollapsed" class="auth-status-card">
+          <div class="auth-user-name">{{ props.currentUser?.username || '当前用户' }}</div>
+          <button class="auth-logout-btn" @click="logout">退出登录</button>
+        </div>
       </div>
     </aside>
     
     <main class="main-content">
       <div class="messages-container" ref="messagesContainerRef">
-        <div v-if="messages.length === 0" class="empty-state">
-          <h1>Interface-Agent AI Agent</h1>
-          <p>请输入厂商接口信息，AI 将为您完成全流程配置</p>
-        </div>
-        
-        <div 
-          v-for="(message, index) in messages" 
-          :key="index"
-          :class="['message', message.role]"
-        >
-          <div v-if="message.role === 'user'" class="user-text">{{ message.content }}</div>
+          <div v-if="messages.length === 0" class="empty-state">
+            <h1>接口AI助手</h1>
+            <p>请输入厂商接口信息，AI 将为您完成全流程配置</p>
+          </div>
           
-          <template v-else>
+          <div 
+            v-for="(message, index) in messages" 
+            :key="index"
+            :class="['message', message.role]"
+          >
+            <div v-if="message.role === 'user'" class="user-text">{{ message.content }}</div>
+            
+            <template v-else>
+              <div class="message-avatar">
+                <div class="avatar ai-avatar">AI</div>
+              </div>
+              <div class="message-content">
+                <div class="assistant-text">
+                  <template v-for="(part, idx) in parseContent(message.content)" :key="idx">
+                    <div v-if="part.type === 'text'" class="text-part" style="white-space: pre-wrap;">{{ part.content }}</div>
+                    <div v-else class="code-block">
+                      <div class="code-header">
+                        <span class="language-tag">{{ part.language }}</span>
+                        <button class="copy-btn" @click="copyCode(part.content)">
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                            <path d="M8 4v12a2 2 0 002 2h8a2 2 0 002-2V7.242a2 2 0 00-.602-1.43L16.083 2.57A2 2 0 0014.685 2H10a2 2 0 00-2 2z" stroke="currentColor" stroke-width="2"/>
+                            <path d="M16 18v2a2 2 0 01-2 2H6a2 2 0 01-2-2V9a2 2 0 012-2h2" stroke="currentColor" stroke-width="2"/>
+                          </svg>
+                          复制
+                        </button>
+                      </div>
+                      <pre><code>{{ part.content }}</code></pre>
+                    </div>
+                  </template>
+                </div>
+              </div>
+            </template>
+          </div>
+          
+          <div v-if="isLoading" class="message assistant">
             <div class="message-avatar">
               <div class="avatar ai-avatar">AI</div>
             </div>
             <div class="message-content">
-              <div class="assistant-text">
-                <template v-for="(part, idx) in parseContent(message.content)" :key="idx">
-                  <div v-if="part.type === 'text'" class="text-part" style="white-space: pre-wrap;">{{ part.content }}</div>
-                  <div v-else class="code-block">
-                    <div class="code-header">
-                      <span class="language-tag">{{ part.language }}</span>
-                      <button class="copy-btn" @click="copyCode(part.content)">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                          <path d="M8 4v12a2 2 0 002 2h8a2 2 0 002-2V7.242a2 2 0 00-.602-1.43L16.083 2.57A2 2 0 0014.685 2H10a2 2 0 00-2 2z" stroke="currentColor" stroke-width="2"/>
-                          <path d="M16 18v2a2 2 0 01-2 2H6a2 2 0 01-2-2V9a2 2 0 012-2h2" stroke="currentColor" stroke-width="2"/>
-                        </svg>
-                        复制
-                      </button>
-                    </div>
-                    <pre><code>{{ part.content }}</code></pre>
-                  </div>
-                </template>
-              </div>
+              <span class="loading-dots">思考中</span>
             </div>
-          </template>
+          </div>
         </div>
         
-        <div v-if="isLoading" class="message assistant">
-          <div class="message-avatar">
-            <div class="avatar ai-avatar">AI</div>
+        <div class="input-area">
+          <div class="input-container">
+            <textarea
+              v-model="inputPrompt"
+              :disabled="isLoading"
+              placeholder="请输入厂商接口信息，例如：我要对接 HIS 建档接口..."
+              @keydown.enter.exact.prevent="sendMessage"
+              rows="1"
+              ref="textareaRef"
+            ></textarea>
+            <button 
+              @click="sendMessage" 
+              :disabled="isLoading || !inputPrompt.trim()"
+              class="send-btn"
+            >
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                <path d="M22 2L11 13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+              </svg>
+            </button>
           </div>
-          <div class="message-content">
-            <span class="loading-dots">思考中</span>
-          </div>
+          <p class="input-hint">内容由 AI 生成，仅供参考</p>
         </div>
-      </div>
-      
-      <div class="input-area">
-        <div class="input-container">
-          <textarea
-            v-model="inputPrompt"
-            :disabled="isLoading"
-            placeholder="请输入厂商接口信息，例如：我要对接 HIS 建档接口..."
-            @keydown.enter.exact.prevent="sendMessage"
-            rows="1"
-            ref="textareaRef"
-          ></textarea>
-          <button 
-            @click="sendMessage" 
-            :disabled="isLoading || !inputPrompt.trim()"
-            class="send-btn"
-          >
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
-              <path d="M22 2L11 13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-              <path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-            </svg>
-          </button>
-        </div>
-        <p class="input-hint">内容由 AI 生成，仅供参考</p>
-      </div>
     </main>
   </div>
 </template>
@@ -387,7 +400,34 @@ const copyCode = async (code) => {
 .sidebar-content {
   padding: 16px;
   flex: 1;
+  display: flex;
+  flex-direction: column;
   overflow-y: auto;
+}
+
+.auth-status-card {
+  border: 1px solid #3a3a3a;
+  background: #232323;
+  border-radius: 10px;
+  padding: 12px;
+  margin-top: auto;
+}
+
+.auth-user-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+}
+
+.auth-logout-btn {
+  width: 100%;
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid #545454;
+  background: #2f2f2f;
+  color: #fff;
+  cursor: pointer;
 }
 
 .new-chat-btn {
