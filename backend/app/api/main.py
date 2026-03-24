@@ -1,25 +1,51 @@
 """FastAPI 后端服务"""
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-import subprocess
+import asyncio
 import logging
 import uuid
-import select
 import os
-from collections import deque
+import socket
+import threading
+from queue import Queue
+from contextlib import asynccontextmanager
 from pathlib import Path
 import sys
-import threading
 import uvicorn
+from rich.console import Console
 
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[3]))
 
-from backend.app.config import REPO_ROOT, VENV_PYTHON
+from backend.app.config import REPO_ROOT
+from backend.app.auth import (
+    AUTH_ENABLED,
+    AuthUser,
+    BootstrapAdminRequest,
+    CreateUserRequest,
+    LoginRequest,
+    RegisterRequest,
+    VALID_ROLES,
+    count_users,
+    create_user,
+    get_user_by_username,
+    get_current_user,
+    init_auth_schema,
+    login_with_password,
+    require_permission,
+)
+from backend.app.chat import (
+    append_chat_pair,
+    get_session_history,
+    get_session_messages,
+    init_chat_schema,
+    list_user_sessions,
+)
+from backend.app.agents.plan_resolve_runner import run_plan_and_resolve
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,14 +53,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("interface-agent-api")
 
-app = FastAPI(title="Interface-Agent AI API")
-AGENT_ENTRY = REPO_ROOT / "backend" / "app" / "agents" / "main.py"
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    if AUTH_ENABLED:
+        init_auth_schema()
+        init_chat_schema()
+    yield
+
+
+app = FastAPI(title="Interface-Agent AI API", lifespan=lifespan)
 FRONTEND_DIST_DIR = REPO_ROOT / "backend" / "app" / "static"
 FRONTEND_INDEX_FILE = FRONTEND_DIST_DIR / "index.html"
-MAX_SESSION_HISTORY = 20
 MAX_REQUEST_HISTORY = 12
-session_histories: dict[str, deque[dict[str, str]]] = {}
-session_lock = threading.Lock()
 
 # 允许 CORS (前端跨域访问)
 app.add_middleware(
@@ -45,11 +75,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 class ChatRequest(BaseModel):
     prompt: str
     sessionId: str | None = None
-    history: list[dict[str, str]] | None = None
 
 
 class ChatResponse(BaseModel):
@@ -57,34 +85,15 @@ class ChatResponse(BaseModel):
     success: bool
 
 
-def normalize_history(history: list[dict[str, str]] | None) -> list[dict[str, str]]:
-    if not history:
-        return []
-    normalized: list[dict[str, str]] = []
-    for item in history[-MAX_REQUEST_HISTORY:]:
-        role = (item.get("role") or "").strip()
-        content = (item.get("content") or "").strip()
-        if role in {"user", "assistant"} and content:
-            normalized.append({"role": role, "content": content[:1200]})
-    return normalized
-
-
-def get_session_history(session_id: str) -> list[dict[str, str]]:
-    with session_lock:
-        session_deque = session_histories.get(session_id)
-        if not session_deque:
-            return []
-        return list(session_deque)[-MAX_REQUEST_HISTORY:]
-
-
-def update_session_history(session_id: str, role: str, content: str):
-    cleaned = content.strip()
-    if not cleaned:
-        return
-    with session_lock:
-        if session_id not in session_histories:
-            session_histories[session_id] = deque(maxlen=MAX_SESSION_HISTORY)
-        session_histories[session_id].append({"role": role, "content": cleaned[:1200]})
+def detect_lan_ip() -> str:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(("8.8.8.8", 80))
+        lan_ip = sock.getsockname()[0]
+        sock.close()
+        return lan_ip
+    except Exception:
+        return "127.0.0.1"
 
 
 def build_contextual_input(prompt: str, history: list[dict[str, str]]) -> str:
@@ -100,7 +109,10 @@ def build_contextual_input(prompt: str, history: list[dict[str, str]]) -> str:
 
 
 @app.post("/api/chat")
-async def chat(request: ChatRequest):
+async def chat(
+    request: ChatRequest,
+    current_user: AuthUser = Depends(require_permission("chat:use")),
+):
     """
     处理用户聊天请求 - 流式输出
     
@@ -112,103 +124,69 @@ async def chat(request: ChatRequest):
     """
     request_id = str(uuid.uuid4())[:8]
     session_id = request.sessionId or str(uuid.uuid4())
-    request_history = normalize_history(request.history)
-    session_history = get_session_history(session_id)
-    merged_history = (session_history + request_history)[-MAX_REQUEST_HISTORY:]
+    session_history = []
+    if AUTH_ENABLED and current_user.userId > 0:
+        session_history = get_session_history(current_user.userId, session_id, MAX_REQUEST_HISTORY)
     logger.info("request_id=%s 收到请求", request_id)
-    logger.info("request_id=%s session_id=%s 输入预览=%s", request_id, session_id, request.prompt[:100].replace("\n", " "))
+    logger.info("request_id=%s session_id=%s 输入预览=%s", request_id, session_id, request.prompt[:1000].replace("\n", " "))
 
-    input_text = build_contextual_input(request.prompt, merged_history)
+    input_text = build_contextual_input(request.prompt, session_history)
     
     try:
-        command = [
-            str(VENV_PYTHON),
-            "-u",
-            str(AGENT_ENTRY),
-            "plan-execute",
-            "--stream",
-        ]
-        logger.info("request_id=%s 启动Agent命令=%s", request_id, " ".join(command))
-        process = subprocess.Popen(
-            [
-                *command
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=False,
-            bufsize=0,
-            cwd=str(REPO_ROOT)
-        )
-        logger.info("request_id=%s Agent进程已启动 pid=%s", request_id, process.pid)
-        
-        process.stdin.write(input_text.encode("utf-8"))
-        process.stdin.close()
-        
+        logger.info("request_id=%s 用户输出=%s", request_id, input_text.replace("\n", " "))
+
         async def generate_response():
             try:
-                line_buffer = ""
-                stderr_buffer = ""
                 response_fragments: list[str] = []
+                stream_queue: Queue[str | None] = Queue()
+                error_holder: dict[str, str] = {}
+
+                class QueueWriter:
+                    def write(self, text: str):
+                        if text:
+                            stream_queue.put(text)
+                        return len(text)
+
+                    def flush(self):
+                        return None
+
+                def run_agent_sync():
+                    try:
+                        stream_console = Console(
+                            file=QueueWriter(),
+                            force_terminal=False,
+                            color_system=None,
+                        )
+                        run_plan_and_resolve(stream_console, input_text, True)
+                    except Exception as exc:
+                        logger.exception("request_id=%s Agent执行异常", request_id)
+                        error_holder["message"] = str(exc)
+                    finally:
+                        stream_queue.put(None)
+
+                worker = threading.Thread(target=run_agent_sync, daemon=True)
+                worker.start()
                 while True:
-                    ready, _, _ = select.select([process.stdout, process.stderr], [], [], 0.2)
-                    if ready:
-                        if process.stdout in ready:
-                            chunk = os.read(process.stdout.fileno(), 1024)
-                            if chunk:
-                                text_chunk = chunk.decode("utf-8", errors="replace")
-                                response_fragments.append(text_chunk)
-                                yield text_chunk
-                                line_buffer += text_chunk
-                                while "\n" in line_buffer:
-                                    line, line_buffer = line_buffer.split("\n", 1)
-                                    logger.info("request_id=%s 流式片段=%s", request_id, line[:120])
-                        if process.stderr in ready:
-                            error_chunk = os.read(process.stderr.fileno(), 1024)
-                            if error_chunk:
-                                error_text = error_chunk.decode("utf-8", errors="replace")
-                                stderr_buffer += error_text
-                                for error_line in error_text.splitlines():
-                                    if "PLAN_PROMPT_" in error_line or error_line.startswith("[system]") or error_line.startswith("[human]"):
-                                        logger.info("request_id=%s Agent调试片段=%s", request_id, error_line[:200])
-                                    else:
-                                        logger.error("request_id=%s Agent错误片段=%s", request_id, error_line[:200])
-                    if process.poll() is not None:
-                        tail = process.stdout.read()
-                        if tail:
-                            tail_text = tail.decode("utf-8", errors="replace")
-                            response_fragments.append(tail_text)
-                            yield tail_text
-                            logger.info("request_id=%s 流式尾部=%s", request_id, tail_text[:120].replace("\n", "\\n"))
-                        error_tail = process.stderr.read()
-                        if error_tail:
-                            error_tail_text = error_tail.decode("utf-8", errors="replace")
-                            stderr_buffer += error_tail_text
-                            for error_line in error_tail_text.splitlines():
-                                if "PLAN_PROMPT_" in error_line or error_line.startswith("[system]") or error_line.startswith("[human]"):
-                                    logger.info("request_id=%s Agent调试尾部=%s", request_id, error_line[:200])
-                                else:
-                                    logger.error("request_id=%s Agent错误尾部=%s", request_id, error_line[:200])
+                    text_chunk = await asyncio.to_thread(stream_queue.get)
+                    if text_chunk is None:
                         break
-                process.stdout.close()
-                process.stderr.close()
-                return_code = process.wait()
-                logger.info("request_id=%s Agent进程退出 code=%s", request_id, return_code)
-                
-                if return_code != 0:
-                    logger.error("request_id=%s Agent异常退出 code=%s", request_id, return_code)
-                    lowered_error = stderr_buffer.lower()
+                    response_fragments.append(text_chunk)
+                    yield text_chunk
+                worker.join(timeout=1)
+
+                if error_holder:
+                    lowered_error = error_holder["message"].lower()
                     if "arrearage" in lowered_error or "overdue-payment" in lowered_error or "access denied" in lowered_error:
                         fallback = "\n\n❌ 模型服务当前不可用（账户欠费或权限受限），请先恢复模型服务后重试。"
                     else:
-                        fallback = f"\n\n❌ AI 生成失败：Agent异常退出，退出码 {return_code}"
+                        fallback = f"\n\n❌ AI 生成失败：{error_holder['message']}"
                     existing_text = "".join(response_fragments)
                     if "❌" not in existing_text:
                         yield fallback
                         response_fragments.append(fallback)
                 full_response = "".join(response_fragments).strip()
-                update_session_history(session_id, "user", request.prompt)
-                update_session_history(session_id, "assistant", full_response)
+                if AUTH_ENABLED and current_user.userId > 0:
+                    append_chat_pair(current_user.userId, session_id, request.prompt, full_response)
             except Exception as e:
                 logger.exception("request_id=%s 流式读取异常", request_id)
                 yield f"\n\n❌ 错误：{str(e)}"
@@ -222,9 +200,77 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail=f"服务器错误：{str(e)}")
 
 
+@app.get("/api/chat/sessions")
+async def chat_sessions(current_user: AuthUser = Depends(require_permission("chat:use"))):
+    sessions = list_user_sessions(current_user.userId, limit=50)
+    return {"sessions": sessions}
+
+
+@app.get("/api/chat/sessions/{session_id}/messages")
+async def chat_session_messages(
+    session_id: str,
+    current_user: AuthUser = Depends(require_permission("chat:use")),
+):
+    messages = get_session_messages(current_user.userId, session_id, limit=300)
+    return {"sessionId": session_id, "messages": messages}
+
+
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "interface-agent-ai"}
+    return {"status": "ok", "service": "interface-agent-ai", "authEnabled": AUTH_ENABLED}
+
+
+@app.post("/api/auth/bootstrap-admin")
+async def bootstrap_admin(request: BootstrapAdminRequest):
+    if count_users() > 0:
+        raise HTTPException(status_code=400, detail="系统已初始化用户，不能重复引导")
+    if request.username.strip() == "" or request.password.strip() == "":
+        raise HTTPException(status_code=400, detail="用户名和密码不能为空")
+    created = create_user(request.username.strip(), request.password, "admin")
+    return {"success": True, "userId": created["user_id"], "username": created["username"], "role": created["role"]}
+
+
+@app.post("/api/auth/login")
+async def login(request: LoginRequest):
+    return login_with_password(request.username.strip(), request.password)
+
+
+@app.post("/api/auth/register")
+async def register(request: RegisterRequest):
+    username = request.username.strip()
+    password = request.password.strip()
+    if username == "" or password == "":
+        raise HTTPException(status_code=400, detail="用户名和密码不能为空")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="密码长度至少6位")
+    existing = get_user_by_username(username)
+    if existing:
+        raise HTTPException(status_code=409, detail="用户名已存在")
+    create_user(username, request.password, "operator")
+    return login_with_password(username, request.password)
+
+
+@app.get("/api/auth/me")
+async def me(current_user: AuthUser = Depends(get_current_user)):
+    return current_user
+
+
+@app.post("/api/auth/users")
+async def create_user_api(
+    request: CreateUserRequest,
+    _current_user: AuthUser = Depends(require_permission("user:manage")),
+):
+    role = request.role.strip()
+    if role not in set(VALID_ROLES):
+        raise HTTPException(status_code=400, detail="角色不合法")
+    username = request.username.strip()
+    if username == "" or request.password.strip() == "":
+        raise HTTPException(status_code=400, detail="用户名和密码不能为空")
+    existing = get_user_by_username(username)
+    if existing:
+        raise HTTPException(status_code=409, detail="用户名已存在")
+    created = create_user(username, request.password, role)
+    return {"success": True, "userId": created["user_id"], "username": created["username"], "role": created["role"]}
 
 
 if (FRONTEND_DIST_DIR / "assets").exists():
@@ -251,8 +297,13 @@ async def frontend_spa_fallback(full_path: str):
 
 
 if __name__ == "__main__":
-    api_host = os.getenv("API_HOST", "127.0.0.1")
+    api_host = os.getenv("API_HOST", "0.0.0.0")
     api_port = int(os.getenv("API_PORT", "8001"))
-    display_host = api_host if api_host != "0.0.0.0" else os.getenv("API_DISPLAY_HOST", "127.0.0.1")
-    logger.info("启动 API 服务 url=http://%s:%s", display_host, api_port)
-    uvicorn.run(app, host=api_host, port=api_port)
+    llm_model_id = os.getenv("LLM_MODEL_ID", "qwen3.5-plus")
+    lan_ip = detect_lan_ip()
+    logger.info("启动 API 服务 url=http://127.0.0.1:%s", api_port)
+    logger.info("启动 API 服务 url=http://%s:%s", lan_ip, api_port)
+    logger.info("当前大模型配置 LLM_MODEL_ID=%s", llm_model_id)
+    logging.getLogger("uvicorn").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+    uvicorn.run(app, host=api_host, port=api_port, log_level="warning")

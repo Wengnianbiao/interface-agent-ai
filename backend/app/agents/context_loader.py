@@ -1,6 +1,6 @@
 import re
 from backend.app.config import PROMPT_DIR
-from backend.app.agents.core import parse_json
+from backend.app.agents.llm import parse_json
 
 
 def read_prompt_file(filename: str) -> str:
@@ -10,20 +10,15 @@ def read_prompt_file(filename: str) -> str:
     return file_path.read_text(encoding="utf-8")
 
 
-def load_system_prompts() -> str:
-    core_files = ["agent_bootstrap.md", "project_knowledge.md"]
-    system_content = []
-    for filename in core_files:
-        content = read_prompt_file(filename)
-        if content:
-            system_content.append(f"=== {filename} ===\n{content}")
-    return "\n\n".join(system_content)
+def load_plan_system_prompts() -> str:
+    content = read_prompt_file("agent_plan.md")
+    return f"=== agent_plan.md ===\n{content}" if content else ""
 
 
 def build_business_catalog() -> list[dict]:
-    bootstrap = read_prompt_file("agent_bootstrap.md")
+    plan_prompt = read_prompt_file("agent_plan.md")
     catalog = []
-    for line in bootstrap.splitlines():
+    for line in plan_prompt.splitlines():
         stripped = line.strip()
         if not stripped.startswith("|"):
             continue

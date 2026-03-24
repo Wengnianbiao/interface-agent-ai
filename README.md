@@ -36,6 +36,7 @@ interface-agent-ai/
 ├── backend/
 │   ├── app/
 │   │   ├── agents/      # Agent 运行与编排逻辑
+│   │   ├── auth/        # 用户认证与角色权限（RBAC）
 │   │   ├── api/         # FastAPI 服务与流式接口
 │   │   ├── prompts/     # 规则、场景知识与执行模板
 │   │   └── static/      # 前端构建产物目录
@@ -58,10 +59,24 @@ interface-agent-ai/
 ```bash
 cd backend
 pip install -r requirements.txt
+export API_HOST="0.0.0.0"
+export API_PORT="8001"
 python app/api/main.py
 ```
 
 后端默认地址：`http://127.0.0.1:8001`
+局域网访问示例：`http://你的局域网IP:8001`
+
+可选环境变量（鉴权与角色）：
+
+```bash
+export DATABASE_URL="postgresql://biao:wengnianbiao@127.0.0.1:5432/postgres"
+export AUTH_ENABLED="true"
+export AUTH_SECRET_KEY="请替换为强随机密钥"
+export ACCESS_TOKEN_EXPIRE_SECONDS="86400"
+```
+
+当 `AUTH_ENABLED=true` 时，接口权限生效，客户端需携带 `Authorization: Bearer <token>`。
 
 启动前端开发环境：
 
@@ -72,6 +87,7 @@ npm run dev
 ```
 
 前端默认地址：`http://127.0.0.1:5173`
+前端开发模式已支持局域网访问（监听 `0.0.0.0`）
 
 生产构建前端：
 
@@ -85,8 +101,26 @@ npm run build
 ## 接口说明
 
 - `POST /api/chat`：流式返回 Agent 处理结果
+- `GET /api/chat/sessions`：查询当前用户会话列表（含问答轮次）
+- `GET /api/chat/sessions/{sessionId}/messages`：查询会话消息明细
+- `POST /api/auth/bootstrap-admin`：系统首次引导创建管理员（仅当用户表为空时可用）
+- `POST /api/auth/login`：用户登录并获取访问令牌
+- `POST /api/auth/register`：用户自注册并自动登录（默认创建为 operator）
+- `GET /api/auth/me`：查询当前登录用户信息
+- `POST /api/auth/users`：创建用户（仅管理员可调用）
 - `GET /health`：健康检查
 - `GET /`：返回前端页面（已构建时）
+
+角色与权限：
+
+- `admin`：可访问聊天、可管理用户
+- `operator`：可访问聊天
+- `viewer`：仅可登录查看身份信息，不可调用聊天
+
+会话持久化：
+
+- `chat_sessions`：按 `user_id + session_id` 保存会话，包含 `qa_count`（问答轮次）与 `message_count`（消息总数）
+- `chat_messages`：保存每条消息（用户/助手）、消息顺序与内容
 
 ## 当前状态说明
 

@@ -1,5 +1,5 @@
 <script setup>
-import { ref, nextTick, watch } from 'vue'
+import { ref, nextTick, watch, onMounted } from 'vue'
 
 const API_BASE_URL = ''
 const props = defineProps({
@@ -20,6 +20,12 @@ const isLoading = ref(false)
 const textareaRef = ref(null)
 const messagesContainerRef = ref(null)
 const isSidebarCollapsed = ref(false)
+const sessionRecords = ref([])
+const isLoadingSessions = ref(false)
+const sessionLoadError = ref('')
+const activeSessionId = ref('')
+const planStartMarker = '<<<PLAN_JSON>>>'
+const planEndMarker = '<<<END_PLAN_JSON>>>'
 const sessionId = ref((typeof crypto !== 'undefined' && crypto.randomUUID)
   ? crypto.randomUUID()
   : `${Date.now()}-${Math.random().toString(36).slice(2)}`)
@@ -27,6 +33,7 @@ const sessionId = ref((typeof crypto !== 'undefined' && crypto.randomUUID)
 // 清空消息
 const clearMessages = () => {
   messages.value = []
+  activeSessionId.value = ''
   sessionId.value = (typeof crypto !== 'undefined' && crypto.randomUUID)
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`
@@ -39,10 +46,87 @@ const toggleSidebar = () => {
 const logout = () => {
   messages.value = []
   inputPrompt.value = ''
+  sessionRecords.value = []
+  activeSessionId.value = ''
   sessionId.value = (typeof crypto !== 'undefined' && crypto.randomUUID)
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`
   emit('logout')
+}
+
+const authHeaders = () => ({
+  ...(props.accessToken ? { Authorization: `Bearer ${props.accessToken}` } : {})
+})
+
+const fetchSessionRecords = async () => {
+  if (!props.accessToken) return
+  isLoadingSessions.value = true
+  sessionLoadError.value = ''
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/chat/sessions`, {
+      headers: authHeaders()
+    })
+    if (!response.ok) {
+      sessionLoadError.value = response.status === 404
+        ? '会话接口未就绪，请重启后端'
+        : '会话记录加载失败'
+      return
+    }
+    const payload = await response.json()
+    sessionRecords.value = Array.isArray(payload?.sessions) ? payload.sessions : []
+  } catch (_error) {
+    sessionRecords.value = []
+    sessionLoadError.value = '会话记录加载失败'
+  } finally {
+    isLoadingSessions.value = false
+  }
+}
+
+const loadSessionMessages = async (targetSessionId) => {
+  if (!targetSessionId || !props.accessToken) return
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/chat/sessions/${encodeURIComponent(targetSessionId)}/messages`, {
+      headers: authHeaders()
+    })
+    if (!response.ok) return
+    const payload = await response.json()
+    const list = Array.isArray(payload?.messages) ? payload.messages : []
+    messages.value = list.map((item) => ({
+      role: item.role,
+      content: item.content
+    }))
+    sessionId.value = targetSessionId
+    activeSessionId.value = targetSessionId
+    scrollToBottom()
+  } catch (_error) {
+  }
+}
+
+const selectSession = async (targetSessionId) => {
+  if (!targetSessionId || isLoading.value) return
+  await loadSessionMessages(targetSessionId)
+}
+
+const formatSessionMeta = (record) => {
+  const qa = Number(record?.qaCount || 0)
+  return `${qa}轮对话`
+}
+
+const extractPlanPayload = (text) => {
+  const start = text.indexOf(planStartMarker)
+  const end = text.indexOf(planEndMarker)
+  if (start === -1 || end === -1 || end <= start) {
+    return { cleanText: text, plan: null }
+  }
+  const jsonText = text.slice(start + planStartMarker.length, end).trim()
+  let plan = null
+  try {
+    plan = JSON.parse(jsonText)
+  } catch (_error) {
+    plan = null
+  }
+  const cleaned = `${text.slice(0, start)}${text.slice(end + planEndMarker.length)}`.trim()
+  return { cleanText: cleaned, plan }
 }
 
 // 滚动到底部
@@ -68,6 +152,19 @@ watch(inputPrompt, () => {
   nextTick(() => {
     autoResizeTextarea()
   })
+})
+
+watch(() => props.accessToken, async (newToken) => {
+  if (newToken) {
+    await fetchSessionRecords()
+  } else {
+    sessionRecords.value = []
+    sessionLoadError.value = ''
+  }
+})
+
+onMounted(async () => {
+  await fetchSessionRecords()
 })
 
 // 发送消息
@@ -98,7 +195,7 @@ const sendMessage = async () => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...(props.accessToken ? { Authorization: `Bearer ${props.accessToken}` } : {})
+        ...authHeaders()
       },
       body: JSON.stringify({
         prompt: userMessage,
@@ -108,6 +205,7 @@ const sendMessage = async () => {
     const responseSessionId = response.headers.get('X-Session-Id')
     if (responseSessionId) {
       sessionId.value = responseSessionId
+      activeSessionId.value = responseSessionId
     }
     
     if (!response.ok) {
@@ -126,16 +224,23 @@ const sendMessage = async () => {
       const chunk = decoder.decode(value, { stream: true })
       fullContent += chunk
       
+      const extracted = extractPlanPayload(fullContent)
+      const displayContent = extracted.cleanText
+
       // 第一次收到数据时创建消息
       if (aiMessageIndex === -1) {
         aiMessageIndex = messages.value.length
         messages.value.push({
           role: 'assistant',
-          content: fullContent
+          content: displayContent,
+          plan: extracted.plan || null
         })
         isLoading.value = false
       } else {
-        messages.value[aiMessageIndex].content = fullContent
+        messages.value[aiMessageIndex].content = displayContent
+        if (extracted.plan) {
+          messages.value[aiMessageIndex].plan = extracted.plan
+        }
       }
       
       scrollToBottom()
@@ -152,6 +257,7 @@ const sendMessage = async () => {
     }
   } finally {
     isLoading.value = false
+    await fetchSessionRecords()
   }
 }
 
@@ -240,13 +346,31 @@ const copyCode = async (code) => {
         </button>
       </div>
       <div class="sidebar-content">
-        <button class="new-chat-btn" @click="clearMessages">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
-            <path d="M12 5V19M5 12H19" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-          </svg>
-          <span v-show="!isSidebarCollapsed">新建对话</span>
-        </button>
-        <div class="chat-history">
+        <div class="sidebar-top">
+          <button class="new-chat-btn" @click="clearMessages">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+              <path d="M12 5V19M5 12H19" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+            <span v-show="!isSidebarCollapsed">新建对话</span>
+          </button>
+        </div>
+        <div v-show="!isSidebarCollapsed" class="chat-history">
+          <div class="chat-history-title">会话记录</div>
+          <div v-if="isLoadingSessions" class="chat-history-empty">加载中...</div>
+          <div v-else-if="sessionLoadError" class="chat-history-empty">{{ sessionLoadError }}</div>
+          <div v-else-if="sessionRecords.length === 0" class="chat-history-empty">暂无历史会话</div>
+          <div class="chat-history-list">
+            <button
+              v-for="record in sessionRecords"
+              :key="record.sessionId"
+              class="history-item"
+              :class="{ active: activeSessionId === record.sessionId }"
+              @click="selectSession(record.sessionId)"
+            >
+              <div class="history-item-title">{{ record.title }}</div>
+              <div class="history-item-meta">{{ formatSessionMeta(record) }}</div>
+            </button>
+          </div>
         </div>
         <div v-if="!isSidebarCollapsed" class="auth-status-card">
           <div class="auth-user-name">{{ props.currentUser?.username || '当前用户' }}</div>
@@ -274,6 +398,24 @@ const copyCode = async (code) => {
                 <div class="avatar ai-avatar">AI</div>
               </div>
               <div class="message-content">
+                <div v-if="message.plan" class="plan-card">
+                  <div class="plan-card-title">执行计划</div>
+                  <div class="plan-card-subtitle">
+                    <span>{{ message.plan.scenarioName || '通用场景' }}</span>
+                    <span class="plan-card-dot">•</span>
+                    <span>{{ message.plan.taskRoute || '默认路线' }}</span>
+                  </div>
+                  <div v-if="message.plan.objective" class="plan-card-objective">{{ message.plan.objective }}</div>
+                  <div class="plan-steps">
+                    <div v-for="step in message.plan.resolveSteps || []" :key="step.stepNo" class="plan-step">
+                      <div class="plan-step-index">{{ step.stepNo }}</div>
+                      <div class="plan-step-body">
+                        <div class="plan-step-name">{{ step.stepName }}</div>
+                        <div class="plan-step-meta">{{ step.objective }}</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
                 <div class="assistant-text">
                   <template v-for="(part, idx) in parseContent(message.content)" :key="idx">
                     <div v-if="part.type === 'text'" class="text-part" style="white-space: pre-wrap;">{{ part.content }}</div>
@@ -402,7 +544,12 @@ const copyCode = async (code) => {
   flex: 1;
   display: flex;
   flex-direction: column;
-  overflow-y: auto;
+  overflow: hidden;
+  gap: 12px;
+}
+
+.sidebar-top {
+  flex-shrink: 0;
 }
 
 .auth-status-card {
@@ -410,7 +557,7 @@ const copyCode = async (code) => {
   background: #232323;
   border-radius: 10px;
   padding: 12px;
-  margin-top: auto;
+  flex-shrink: 0;
 }
 
 .auth-user-name {
@@ -455,7 +602,70 @@ const copyCode = async (code) => {
 }
 
 .chat-history {
-  margin-top: 16px;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: hidden;
+}
+
+.chat-history-list {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.chat-history-title {
+  font-size: 12px;
+  color: #a9a9a9;
+  margin: 2px 4px 4px;
+}
+
+.chat-history-empty {
+  color: #8f8f8f;
+  font-size: 12px;
+  padding: 8px 10px;
+}
+
+.history-item {
+  width: 100%;
+  text-align: left;
+  border: 1px solid #333;
+  background: #252525;
+  color: #fff;
+  border-radius: 8px;
+  padding: 10px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.history-item:hover {
+  background: #2f2f2f;
+}
+
+.history-item.active {
+  border-color: #6366f1;
+  background: #2a2f52;
+}
+
+.history-item-title {
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.history-item-meta {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #b8b8b8;
 }
 
 /* 右侧主内容区 */
@@ -567,6 +777,87 @@ const copyCode = async (code) => {
 .assistant-text {
   width: 100%;
   max-width: none;
+}
+
+.plan-card {
+  width: 100%;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  padding: 16px;
+  margin-bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.plan-card-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.plan-card-subtitle {
+  font-size: 12px;
+  color: #64748b;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.plan-card-dot {
+  font-size: 10px;
+}
+
+.plan-card-objective {
+  color: #334155;
+  font-size: 13px;
+}
+
+.plan-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.plan-step {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+
+.plan-step-index {
+  width: 24px;
+  height: 24px;
+  border-radius: 8px;
+  background: #6366f1;
+  color: #fff;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.plan-step-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.plan-step-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.plan-step-meta {
+  font-size: 12px;
+  color: #64748b;
 }
 
 /* 代码块样式 - 浅色主题 */
@@ -749,29 +1040,46 @@ const copyCode = async (code) => {
 /* 滚动条美化 */
 .messages-container::-webkit-scrollbar,
 .sidebar-content::-webkit-scrollbar {
-  width: 6px;
+  width: 4px;
 }
 
 .messages-container::-webkit-scrollbar-track,
 .sidebar-content::-webkit-scrollbar-track {
-  background: transparent;
+  background: rgba(15, 23, 42, 0.04);
+  border-radius: 10px;
+}
+
+.sidebar-content::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.chat-history-list::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.02);
 }
 
 .messages-container::-webkit-scrollbar-thumb {
-  background: #d0d0d0;
-  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.18);
+  border-radius: 10px;
 }
 
 .sidebar-content::-webkit-scrollbar-thumb {
-  background: #3a3a3a;
-  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 10px;
+}
+
+.chat-history-list::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
 }
 
 .messages-container::-webkit-scrollbar-thumb:hover {
-  background: #b0b0b0;
+  background: rgba(0, 0, 0, 0.32);
 }
 
 .sidebar-content::-webkit-scrollbar-thumb:hover {
-  background: #4a4a4a;
+  background: rgba(255, 255, 255, 0.32);
+}
+
+.chat-history-list::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
 }
 </style>

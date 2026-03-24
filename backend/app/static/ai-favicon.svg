@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="g1" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5b7cfa"/>
+      <stop offset="100%" stop-color="#33d1ff"/>
+    </linearGradient>
+    <linearGradient id="g2" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#8a5bff"/>
+      <stop offset="100%" stop-color="#5be7ff"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="#0f172a"/>
+  <rect x="20" y="20" width="88" height="88" rx="22" fill="url(#g1)" opacity="0.18"/>
+  <circle cx="64" cy="64" r="30" fill="none" stroke="url(#g2)" stroke-width="8"/>
+  <path d="M48 64h32M64 48v32" stroke="#e6f4ff" stroke-width="8" stroke-linecap="round"/>
+  <circle cx="64" cy="64" r="8" fill="#e6f4ff"/>
+  <circle cx="38" cy="38" r="5" fill="#7ad7ff"/>
+  <circle cx="90" cy="38" r="5" fill="#7ad7ff"/>
+  <circle cx="38" cy="90" r="5" fill="#7ad7ff"/>
+  <circle cx="90" cy="90" r="5" fill="#7ad7ff"/>
+  <path d="M38 38l18 18M90 38L72 56M38 90l18-18M90 90L72 72" stroke="#7ad7ff" stroke-width="4" stroke-linecap="round"/>
+</svg>
