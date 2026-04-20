@@ -129,6 +129,115 @@ const extractPlanPayload = (text) => {
   return { cleanText: cleaned, plan }
 }
 
+const escapeHtml = (value) => value
+  .replaceAll('&', '&amp;')
+  .replaceAll('<', '&lt;')
+  .replaceAll('>', '&gt;')
+  .replaceAll('"', '&quot;')
+  .replaceAll("'", '&#39;')
+
+const renderInlineMarkdown = (source) => {
+  const escaped = escapeHtml(source)
+  return escaped
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+}
+
+const isTableDivider = (line) => {
+  const trimmed = line.trim()
+  if (!trimmed.includes('|')) return false
+  const cells = trimmed
+    .replace(/^\|/, '')
+    .replace(/\|$/, '')
+    .split('|')
+    .map((cell) => cell.trim())
+  if (cells.length === 0) return false
+  return cells.every((cell) => /^:?-{3,}:?$/.test(cell))
+}
+
+const normalizeTableCells = (line) => line
+  .trim()
+  .replace(/^\|/, '')
+  .replace(/\|$/, '')
+  .split('|')
+  .map((cell) => cell.trim())
+
+const renderMarkdownText = (content) => {
+  const lines = content.replaceAll('\r\n', '\n').split('\n')
+  const blocks = []
+  const paragraph = []
+  const listItems = []
+  let i = 0
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return
+    blocks.push(`<p>${paragraph.map((line) => renderInlineMarkdown(line)).join('<br>')}</p>`)
+    paragraph.length = 0
+  }
+
+  const flushList = () => {
+    if (!listItems.length) return
+    const items = listItems.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join('')
+    blocks.push(`<ul>${items}</ul>`)
+    listItems.length = 0
+  }
+
+  while (i < lines.length) {
+    const line = lines[i]
+    const trimmed = line.trim()
+    if (!trimmed) {
+      flushParagraph()
+      flushList()
+      i += 1
+      continue
+    }
+
+    const headingMatch = /^(#{1,6})\s+(.*)$/.exec(trimmed)
+    if (headingMatch) {
+      flushParagraph()
+      flushList()
+      const level = headingMatch[1].length
+      blocks.push(`<h${level}>${renderInlineMarkdown(headingMatch[2])}</h${level}>`)
+      i += 1
+      continue
+    }
+
+    if (/^([-*])\s+/.test(trimmed)) {
+      flushParagraph()
+      listItems.push(trimmed.replace(/^([-*])\s+/, ''))
+      i += 1
+      continue
+    }
+
+    if (trimmed.includes('|') && i + 1 < lines.length && isTableDivider(lines[i + 1])) {
+      flushParagraph()
+      flushList()
+      const headerCells = normalizeTableCells(trimmed)
+      const bodyRows = []
+      i += 2
+      while (i < lines.length && lines[i].trim().includes('|') && lines[i].trim()) {
+        bodyRows.push(normalizeTableCells(lines[i]))
+        i += 1
+      }
+      const head = `<thead><tr>${headerCells.map((cell) => `<th>${renderInlineMarkdown(cell)}</th>`).join('')}</tr></thead>`
+      const body = bodyRows.length
+        ? `<tbody>${bodyRows.map((row) => `<tr>${row.map((cell) => `<td>${renderInlineMarkdown(cell)}</td>`).join('')}</tr>`).join('')}</tbody>`
+        : ''
+      blocks.push(`<div class="markdown-table-wrapper"><table>${head}${body}</table></div>`)
+      continue
+    }
+
+    paragraph.push(trimmed)
+    i += 1
+  }
+
+  flushParagraph()
+  flushList()
+  return blocks.join('')
+}
+
 // 滚动到底部
 const scrollToBottom = () => {
   nextTick(() => {
@@ -167,93 +276,143 @@ onMounted(async () => {
   await fetchSessionRecords()
 })
 
+// SSE事件解析器
+const parseSSEEvents = (text) => {
+  const events = []
+  // 按双换行分割事件块
+  const blocks = text.split('\n\n')
+  for (const block of blocks) {
+    const trimmed = block.trim()
+    if (!trimmed) continue
+    let eventType = 'message'
+    let data = ''
+    const lines = trimmed.split('\n')
+    for (const line of lines) {
+      if (line.startsWith('event: ')) {
+        eventType = line.slice(7).trim()
+      } else if (line.startsWith('data: ')) {
+        data = line.slice(6)
+      }
+    }
+    if (data) {
+      events.push({ event: eventType, data })
+    }
+  }
+  return events
+}
+
 // 发送消息
 const sendMessage = async () => {
   if (!inputPrompt.value.trim() || isLoading.value) return
-  
+
   const userMessage = inputPrompt.value.trim()
   let aiMessageIndex = -1
-  
-  messages.value.push({
-    role: 'user',
-    content: userMessage
-  })
-  
+
+  messages.value.push({ role: 'user', content: userMessage })
   scrollToBottom()
-  
+
   inputPrompt.value = ''
   nextTick(() => {
-    if (textareaRef.value) {
-      textareaRef.value.style.height = 'auto'
-    }
+    if (textareaRef.value) textareaRef.value.style.height = 'auto'
   })
-  
+
   isLoading.value = true
-  
+
   try {
     const response = await fetch(`${API_BASE_URL}/api/chat`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...authHeaders()
-      },
-      body: JSON.stringify({
-        prompt: userMessage,
-        sessionId: sessionId.value
-      })
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ prompt: userMessage, sessionId: sessionId.value })
     })
+
     const responseSessionId = response.headers.get('X-Session-Id')
     if (responseSessionId) {
       sessionId.value = responseSessionId
       activeSessionId.value = responseSessionId
     }
-    
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`)
-    }
-    
+
+    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`)
+
     const reader = response.body.getReader()
     const decoder = new TextDecoder('utf-8')
-    
-    let fullContent = ''
-    
+    let sseBuffer = ''
+    let contentText = ''
+
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
-      
-      const chunk = decoder.decode(value, { stream: true })
-      fullContent += chunk
-      
-      const extracted = extractPlanPayload(fullContent)
-      const displayContent = extracted.cleanText
 
-      // 第一次收到数据时创建消息
-      if (aiMessageIndex === -1) {
-        aiMessageIndex = messages.value.length
-        messages.value.push({
-          role: 'assistant',
-          content: displayContent,
-          plan: extracted.plan || null
-        })
-        isLoading.value = false
-      } else {
-        messages.value[aiMessageIndex].content = displayContent
-        if (extracted.plan) {
-          messages.value[aiMessageIndex].plan = extracted.plan
+      sseBuffer += decoder.decode(value, { stream: true })
+
+      // 尝试解析完整的SSE事件
+      const lastDoubleNewline = sseBuffer.lastIndexOf('\n\n')
+      if (lastDoubleNewline === -1) continue
+
+      const completePart = sseBuffer.slice(0, lastDoubleNewline + 2)
+      sseBuffer = sseBuffer.slice(lastDoubleNewline + 2)
+
+      const events = parseSSEEvents(completePart)
+      for (const evt of events) {
+        if (evt.event === 'thinking') {
+          // 阶段状态 - 创建或更新AI消息
+          let msg = ''
+          try { msg = JSON.parse(evt.data).message } catch { msg = evt.data }
+          if (aiMessageIndex === -1) {
+            aiMessageIndex = messages.value.length
+            messages.value.push({ role: 'assistant', content: '', thinking: msg, plan: null })
+            isLoading.value = false
+          } else {
+            messages.value[aiMessageIndex].thinking = msg
+          }
+        } else if (evt.event === 'plan') {
+          let planData = null
+          try { planData = JSON.parse(evt.data) } catch { /* ignore */ }
+          if (aiMessageIndex === -1) {
+            aiMessageIndex = messages.value.length
+            messages.value.push({ role: 'assistant', content: '', plan: planData })
+            isLoading.value = false
+          } else {
+            messages.value[aiMessageIndex].plan = planData
+          }
+        } else if (evt.event === 'content') {
+          contentText += evt.data
+          if (aiMessageIndex === -1) {
+            aiMessageIndex = messages.value.length
+            messages.value.push({ role: 'assistant', content: contentText, plan: null })
+            isLoading.value = false
+          } else {
+            messages.value[aiMessageIndex].content = contentText
+            messages.value[aiMessageIndex].thinking = null
+          }
+        } else if (evt.event === 'tool_call') {
+          let toolData = null
+          try { toolData = JSON.parse(evt.data) } catch { /* ignore */ }
+          if (aiMessageIndex !== -1 && toolData) {
+            const resultJson = JSON.stringify(toolData.result || {}, null, 2)
+            contentText += `\n\n\u3010MCP\u6267\u884c\u7ed3\u679c\u3011\n\`\`\`json\n${resultJson}\n\`\`\``
+            messages.value[aiMessageIndex].content = contentText
+          }
+        } else if (evt.event === 'error') {
+          let errMsg = ''
+          try { errMsg = JSON.parse(evt.data).message } catch { errMsg = evt.data }
+          if (aiMessageIndex === -1) {
+            aiMessageIndex = messages.value.length
+            messages.value.push({ role: 'assistant', content: `\u274c ${errMsg}` })
+            isLoading.value = false
+          } else {
+            messages.value[aiMessageIndex].content += `\n\n\u274c ${errMsg}`
+          }
         }
+        // done event - 不需要额外处理
       }
-      
       scrollToBottom()
     }
   } catch (error) {
     console.error('请求失败:', error)
     if (aiMessageIndex === -1) {
-      messages.value.push({
-        role: 'assistant',
-        content: `❌ 请求失败：${error.message}`
-      })
+      messages.value.push({ role: 'assistant', content: `\u274c \u8bf7\u6c42\u5931\u8d25\uff1a${error.message}` })
     } else {
-      messages.value[aiMessageIndex].content = `❌ 请求失败：${error.message}`
+      messages.value[aiMessageIndex].content = `\u274c \u8bf7\u6c42\u5931\u8d25\uff1a${error.message}`
     }
   } finally {
     isLoading.value = false
@@ -274,7 +433,8 @@ const parseContent = (content) => {
     if (match.index > lastIndex) {
       parts.push({
         type: 'text',
-        content: content.substring(lastIndex, match.index)
+        content: content.substring(lastIndex, match.index),
+        html: renderMarkdownText(content.substring(lastIndex, match.index))
       })
     }
     
@@ -300,7 +460,8 @@ const parseContent = (content) => {
       if (beforeCode) {
         parts.push({
           type: 'text',
-          content: beforeCode
+          content: beforeCode,
+          html: renderMarkdownText(beforeCode)
         })
       }
       
@@ -315,12 +476,13 @@ const parseContent = (content) => {
       // 正常文本
       parts.push({
         type: 'text',
-        content: remaining
+        content: remaining,
+        html: renderMarkdownText(remaining)
       })
     }
   }
   
-  return parts.length > 0 ? parts : [{ type: 'text', content }]
+  return parts.length > 0 ? parts : [{ type: 'text', content, html: renderMarkdownText(content) }]
 }
 
 // 复制代码
@@ -398,6 +560,9 @@ const copyCode = async (code) => {
                 <div class="avatar ai-avatar">AI</div>
               </div>
               <div class="message-content">
+                <div v-if="message.thinking" class="thinking-status">
+                  <span class="thinking-indicator">{{ message.thinking }}</span>
+                </div>
                 <div v-if="message.plan" class="plan-card">
                   <div class="plan-card-title">执行计划</div>
                   <div class="plan-card-subtitle">
@@ -418,7 +583,7 @@ const copyCode = async (code) => {
                 </div>
                 <div class="assistant-text">
                   <template v-for="(part, idx) in parseContent(message.content)" :key="idx">
-                    <div v-if="part.type === 'text'" class="text-part" style="white-space: pre-wrap;">{{ part.content }}</div>
+                    <div v-if="part.type === 'text'" class="text-part" v-html="part.html"></div>
                     <div v-else class="code-block">
                       <div class="code-header">
                         <span class="language-tag">{{ part.language }}</span>
@@ -791,6 +956,22 @@ const copyCode = async (code) => {
   gap: 10px;
 }
 
+.thinking-status {
+  padding: 8px 0;
+  margin-bottom: 8px;
+}
+
+.thinking-indicator {
+  color: #6366f1;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.thinking-indicator::after {
+  content: '...';
+  animation: dots 1.5s steps(4, end) infinite;
+}
+
 .plan-card-title {
   font-size: 16px;
   font-weight: 600;
@@ -927,6 +1108,86 @@ const copyCode = async (code) => {
 
 .text-part {
   margin: 8px 0;
+  line-height: 1.8;
+  color: #1a1a1a;
+}
+
+.text-part :deep(p) {
+  margin: 0 0 10px;
+}
+
+.text-part :deep(h1),
+.text-part :deep(h2),
+.text-part :deep(h3),
+.text-part :deep(h4),
+.text-part :deep(h5),
+.text-part :deep(h6) {
+  margin: 16px 0 10px;
+  color: #0f172a;
+  font-weight: 600;
+}
+
+.text-part :deep(ul) {
+  margin: 8px 0 12px 22px;
+  padding: 0;
+}
+
+.text-part :deep(li) {
+  margin: 4px 0;
+}
+
+.text-part :deep(strong) {
+  font-weight: 700;
+}
+
+.text-part :deep(em) {
+  font-style: italic;
+}
+
+.text-part :deep(a) {
+  color: #4f46e5;
+  text-decoration: none;
+}
+
+.text-part :deep(a:hover) {
+  text-decoration: underline;
+}
+
+.text-part :deep(code) {
+  font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
+  font-size: 13px;
+  background: #eef2ff;
+  color: #3730a3;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.text-part :deep(.markdown-table-wrapper) {
+  width: 100%;
+  overflow-x: auto;
+  margin: 10px 0 14px;
+}
+
+.text-part :deep(table) {
+  width: 100%;
+  border-collapse: collapse;
+  border: 1px solid #dfe3ea;
+  font-size: 14px;
+  background: #fff;
+}
+
+.text-part :deep(th),
+.text-part :deep(td) {
+  border: 1px solid #dfe3ea;
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.text-part :deep(th) {
+  background: #f8fafc;
+  color: #0f172a;
+  font-weight: 600;
 }
 
 /* 输入区域 */

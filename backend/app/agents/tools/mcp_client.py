@@ -1,8 +1,10 @@
+"""MCP工具客户端 - 负责与MCP服务交互"""
+
 import json
 from typing import Optional, List, Any
 import urllib.request
 from backend.app.config import MCP_BASE_URL
-from backend.app.agents.llm import parse_json
+from backend.app.agents.utils import parse_json
 
 
 def request_mcp(method: str, path: str, body: Optional[dict]) -> dict:

@@ -1,16 +1,16 @@
 import json
 import re
-import sys
 import logging
-from typing import Any, Callable
+from typing import Any, AsyncGenerator
 from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
-from backend.app.agents.llm import extract_json_text, parse_json
+from backend.app.agents.utils import extract_json_text, parse_json
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s - %(message)s",
 )
 logger = logging.getLogger("interface-agent-llm")
+PLAN_REQUIRED_KEYS = {"taskRoute", "scenarioName", "businessFile", "objective", "needMcp", "shouldAskUser", "resolveSteps"}
 
 
 def _stringify_stream_content(content: Any) -> str:
@@ -30,33 +30,42 @@ def _stringify_stream_content(content: Any) -> str:
     return ""
 
 
-def _stream_llm_text(runnable, payload: dict, on_chunk: Callable[[str], None] | None = None) -> str:
-    fragments: list[str] = []
-    for chunk in runnable.stream(payload):
+async def astream_llm_chunks(runnable, payload: dict) -> AsyncGenerator[str, None]:
+    """异步流式调用LLM，逐chunk yield文本片段"""
+    async for chunk in runnable.astream(payload):
         text_chunk = _stringify_stream_content(getattr(chunk, "content", ""))
-        if not text_chunk:
+        if text_chunk:
+            yield text_chunk
+
+
+def extract_plan_output(response_content: str) -> dict:
+    candidates: list[str] = []
+    extracted = extract_json_text(response_content)
+    if extracted:
+        candidates.append(extracted)
+    json_blocks = re.findall(r"```json\s*([\s\S]*?)```", response_content)
+    candidates.extend([block.strip() for block in json_blocks if block.strip()])
+    for candidate in candidates:
+        parsed, _ = parse_json(candidate)
+        if not isinstance(parsed, dict):
             continue
-        fragments.append(text_chunk)
-        if on_chunk:
-            on_chunk(text_chunk)
-    return "".join(fragments)
+        if not PLAN_REQUIRED_KEYS.issubset(set(parsed.keys())):
+            continue
+        if not isinstance(parsed.get("resolveSteps"), list):
+            continue
+        return parsed
+    raise ValueError("Plan 输出解析失败：未提取到完整的规划 JSON")
 
 
-def plan_task(
-    llm,
-    user_input: str,
-    catalog: list[dict],
-    debug_prompt: bool = False,
-    on_chunk: Callable[[str], None] | None = None,
-) -> dict:
-    catalog_text = "\n".join(
-        [f"- {item['businessName']} | {item['interfaceUri']} | {item['fileName']}" for item in catalog]
-    )
+def build_plan_chain(llm, user_input: str, system_prompt: str) -> tuple:
+    """构建 Plan 阶段的 chain 和 payload，返回 (runnable, payload)"""
     planner_prompt = ChatPromptTemplate(
         messages=[
             SystemMessagePromptTemplate.from_template(
-                "你是 Plan 阶段规划器。"
-                "请根据用户输入识别任务路由和业务场景。"
+                "{system_prompt}\n\n"
+                "你当前处于 Plan 阶段。"
+                "你的任务是根据用户输入判定任务路由并拆解执行步骤。"
+                "本阶段不要展开业务文档内容。"
                 "只输出严格JSON，不要输出其他文字。"
                 "JSON必须包含这些键："
                 "taskRoute, scenarioName, businessFile, objective, needMcp, shouldAskUser, resolveSteps。"
@@ -64,52 +73,21 @@ def plan_task(
                 "每个步骤必须包含 stepName, objective, expectedOutput, taskRoute, needMcp。"
             ),
             HumanMessagePromptTemplate.from_template(
-                "候选场景列表:\n{catalog}\n\n用户输入:\n{input}\n\n请输出规划JSON。"
+                "用户输入:\n{input}\n\n请输出规划JSON。"
             ),
         ]
     )
-    plan_input = {
-        "catalog": catalog_text,
+    payload = {
+        "system_prompt": system_prompt,
         "input": user_input,
     }
-    if debug_prompt:
-        formatted_messages = planner_prompt.format_messages(**plan_input)
-        print("=== PLAN_PROMPT_START ===", file=sys.stderr)
-        for message in formatted_messages:
-            print(f"[{getattr(message, 'type', 'unknown')}]", file=sys.stderr)
-            print(message.content, file=sys.stderr)
-            print("", file=sys.stderr)
-        print("=== PLAN_PROMPT_END ===", file=sys.stderr)
-    planner_runnable = planner_prompt | llm
-    try:
-        response_content = _stream_llm_text(planner_runnable, plan_input, on_chunk=on_chunk)
-    except Exception as exc:
-        logger.info("LLM plan 调用失败: %s", exc)
-        raise
-    logger.info("LLM plan 响应=%s", response_content)
-    parsed, _ = parse_json(extract_json_text(response_content))
-    if parsed:
-        return parsed
-    return {
-        "taskRoute": "配置生成",
-        "scenarioName": "待判定场景",
-        "businessFile": "",
-        "objective": "完成用户请求",
-        "needMcp": False,
-        "shouldAskUser": False,
-        "resolveSteps": [
-            {
-                "stepName": "生成结果",
-                "objective": "完成用户请求",
-                "expectedOutput": "给出明确结论",
-                "taskRoute": "配置生成",
-                "needMcp": False,
-            }
-        ],
-    }
+    formatted_messages = planner_prompt.format_messages(**payload)
+    for message in formatted_messages:
+        logger.info("[Plan Prompt][%s] %s", getattr(message, 'type', 'unknown'), message.content[:500])
+    return planner_prompt | llm, payload
 
 
-def resolve_task(
+def build_resolve_chain(
     llm,
     user_input: str,
     mode: str,
@@ -119,8 +97,8 @@ def resolve_task(
     jarvis_params: dict,
     current_step: dict,
     previous_steps: list[dict],
-    on_chunk: Callable[[str], None] | None = None,
-) -> dict:
+) -> tuple:
+    """构建 Resolve 阶段的 chain 和 payload，返回 (runnable, payload, step_route, need_mcp_default)"""
     expected_route = str(plan.get("taskRoute", ""))
     step_route = str(current_step.get("taskRoute", expected_route))
     need_mcp_default = bool(current_step.get("needMcp")) or mode == "mcp" or step_route == "自动化配置"
@@ -149,7 +127,7 @@ def resolve_task(
             ),
         ]
     )
-    resolve_input = {
+    payload = {
         "system_prompt": system_prompt,
         "business_context": business_context,
         "plan": json.dumps(plan, ensure_ascii=False),
@@ -160,12 +138,11 @@ def resolve_task(
         "mode": mode,
         "input": user_input,
     }
-    resolver_runnable = resolver_prompt | llm
-    try:
-        response_content = _stream_llm_text(resolver_runnable, resolve_input, on_chunk=on_chunk)
-    except Exception as exc:
-        logger.exception("LLM resolve 调用失败: %s", exc)
-        raise
+    return resolver_prompt | llm, payload, step_route, need_mcp_default
+
+
+def parse_resolve_output(response_content: str, step_route: str, need_mcp_default: bool) -> dict:
+    """解析 Resolve 阶段 LLM 的完整输出文本为结构化 dict"""
     logger.info("LLM resolve 响应=%s", response_content)
     parsed, _ = parse_json(extract_json_text(response_content))
     if parsed and isinstance(parsed, dict) and "reply" in parsed:

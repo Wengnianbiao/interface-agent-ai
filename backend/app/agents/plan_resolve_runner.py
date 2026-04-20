@@ -1,64 +1,36 @@
+"""Plan-and-Resolve Agent - 产出 SSE 事件流的 async generator"""
+
 import json
-import time
-from typing import Optional
-from concurrent.futures import ThreadPoolExecutor
-import typer
-from rich.console import Console
+import logging
+from typing import AsyncGenerator
+
 from backend.app.agents.llm import get_llm
-from backend.app.agents.context_loader import (
+from backend.app.agents.context import (
     load_plan_system_prompts,
-    build_business_catalog,
     load_business_context_by_file,
 )
-from backend.app.agents.pipeline import plan_task, resolve_task
-from backend.app.agents.mcp_client import execute_mcp_sync
+from backend.app.agents.pipeline import (
+    build_plan_chain,
+    build_resolve_chain,
+    extract_plan_output,
+    parse_resolve_output,
+    astream_llm_chunks,
+)
+from backend.app.agents.tools import execute_mcp_sync
+from backend.app.chat.sse import SSEEvent, thinking, plan, content, tool_call, error, done
 
+logger = logging.getLogger("interface-agent")
 
+# 路由常量
 QA_ROUTE = "规则问答"
 EVALUATION_ROUTE = "可行性评估"
 AUTO_CONFIG_ROUTE = "自动化配置"
-SPI_ROUTE = "SPI 扩展"
+SPI_ROUTE = "SPI扩展"
 CONFIG_OUTPUT_ROUTE = "配置生成"
 
 
-def run_with_progress(console: Console, stream: bool, stage: str, fn):
-    if not stream:
-        return fn()
-    start = time.time()
-    heartbeat = 0
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(fn)
-        while not future.done():
-            time.sleep(1)
-            elapsed = int(time.time() - start)
-            if elapsed >= heartbeat + 5:
-                heartbeat = elapsed
-                console.print(f"⏳ {stage}处理中，已等待 {elapsed}s...", markup=False, highlight=False)
-        return future.result()
-
-
-def build_fallback_plan(_input_text: str, resolved_mode: str, _catalog: list[dict]) -> dict:
-    return {
-        "taskRoute": CONFIG_OUTPUT_ROUTE,
-        "scenarioName": "兜底模式",
-        "businessFile": "",
-        "objective": "返回稳定兜底结果",
-        "needMcp": resolved_mode == "mcp",
-        "shouldAskUser": False,
-        "resolveSteps": [
-            {
-                "stepName": "输出兜底结论",
-                "objective": "返回稳定兜底结果",
-                "expectedOutput": "给出明确下一步建议",
-                "taskRoute": CONFIG_OUTPUT_ROUTE,
-                "needMcp": False,
-            }
-        ],
-    }
-
-
-def normalize_task_route(plan: dict, resolved_mode: str) -> str:
-    plan_route = str(plan.get("taskRoute", "")).strip()
+def normalize_task_route(plan_dict: dict, resolved_mode: str) -> str:
+    plan_route = str(plan_dict.get("taskRoute", "")).strip()
     if plan_route in {QA_ROUTE, EVALUATION_ROUTE, AUTO_CONFIG_ROUTE, SPI_ROUTE, CONFIG_OUTPUT_ROUTE}:
         return plan_route
     if resolved_mode == "mcp":
@@ -66,68 +38,42 @@ def normalize_task_route(plan: dict, resolved_mode: str) -> str:
     return CONFIG_OUTPUT_ROUTE
 
 
-def normalize_resolve_steps(plan: dict) -> list[dict]:
-    raw_steps = plan.get("resolveSteps")
-    normalized_steps: list[dict] = []
+def normalize_resolve_steps(plan_dict: dict) -> list[dict]:
+    raw_steps = plan_dict.get("resolveSteps")
+    normalized: list[dict] = []
     if isinstance(raw_steps, list):
         for idx, item in enumerate(raw_steps):
             if not isinstance(item, dict):
                 continue
-            step_name = str(item.get("stepName") or f"步骤{idx + 1}").strip()
-            objective = str(item.get("objective") or plan.get("objective") or "完成用户请求").strip()
-            expected_output = str(item.get("expectedOutput") or "给出明确结果").strip()
-            step_route = str(item.get("taskRoute") or plan.get("taskRoute") or CONFIG_OUTPUT_ROUTE).strip()
-            normalized_steps.append(
-                {
-                    "stepNo": idx + 1,
-                    "stepName": step_name,
-                    "objective": objective,
-                    "expectedOutput": expected_output,
-                    "taskRoute": step_route,
-                    "needMcp": bool(item.get("needMcp")),
-                }
-            )
-    if normalized_steps:
-        return normalized_steps
-    return [
-        {
-            "stepNo": 1,
-            "stepName": "输出结果",
-            "objective": str(plan.get("objective") or "完成用户请求"),
-            "expectedOutput": "给出明确结论",
-            "taskRoute": str(plan.get("taskRoute") or CONFIG_OUTPUT_ROUTE),
-            "needMcp": bool(plan.get("needMcp")),
-        }
-    ]
+            normalized.append({
+                "stepNo": idx + 1,
+                "stepName": str(item.get("stepName") or f"步骤{idx + 1}").strip(),
+                "objective": str(item.get("objective") or plan_dict.get("objective") or "完成用户请求").strip(),
+                "expectedOutput": str(item.get("expectedOutput") or "给出明确结果").strip(),
+                "taskRoute": str(item.get("taskRoute") or plan_dict.get("taskRoute") or CONFIG_OUTPUT_ROUTE).strip(),
+                "needMcp": bool(item.get("needMcp")),
+            })
+    if normalized:
+        return normalized
+    return [{
+        "stepNo": 1,
+        "stepName": "输出结果",
+        "objective": str(plan_dict.get("objective") or "完成用户请求"),
+        "expectedOutput": "给出明确结论",
+        "taskRoute": str(plan_dict.get("taskRoute") or CONFIG_OUTPUT_ROUTE),
+        "needMcp": bool(plan_dict.get("needMcp")),
+    }]
 
 
-def build_fallback_resolved(_user_input: str, plan: dict, resolved_mode: str) -> dict:
-    task_route = normalize_task_route(plan, resolved_mode)
-    if task_route == AUTO_CONFIG_ROUTE:
-        reply = (
-            "【结论】\n- 当前请求可继续生成自动化配置。\n\n"
-            "【说明】\n- 当前返回为兜底结果，请补充更完整的三方入参与返参示例后再生成配置。"
-        )
-    elif task_route == SPI_ROUTE:
-        reply = (
-            "【SPI结论】\n- 该场景可能涉及扩展能力。\n\n"
-            "【下一步】\n- 请补充协议、鉴权、签名/加解密规则，我将给出完整 SPI 方案。"
-        )
-    elif task_route == QA_ROUTE:
-        reply = (
-            "【规则问答】\n- 我会优先解释框架规则与参数映射方式。\n\n"
-            "【建议】\n- 如需输出配置 JSON，请补充具体业务场景与三方入参/返参样例。"
-        )
-    elif task_route == EVALUATION_ROUTE:
-        reply = (
-            "【可行性评估】\n- 我会先判定可配置化、SPI扩展或不支持。\n\n"
-            "【建议】\n- 请补充三方接口文档或完整出入参样例，评估会更准确。"
-        )
-    else:
-        reply = (
-            "【结论】\n- 这是配置生成场景。\n\n"
-            "【说明】\n- 我会输出结构化 JSON 配置，并给出校验建议。"
-        )
+def build_fallback_resolved(plan_dict: dict, resolved_mode: str) -> dict:
+    task_route = normalize_task_route(plan_dict, resolved_mode)
+    fallback_replies = {
+        AUTO_CONFIG_ROUTE: "【结论】\n- 当前请求可继续生成自动化配置。\n\n【说明】\n- 当前返回为兜底结果，请补充更完整的三方入参与返参示例后再生成配置。",
+        SPI_ROUTE: "【SPI结论】\n- 该场景可能涉及扩展能力。\n\n【下一步】\n- 请补充协议、鉴权、签名/加解密规则，我将给出完整 SPI 方案。",
+        QA_ROUTE: "【规则问答】\n- 我会优先解释框架规则与参数映射方式。\n\n【建议】\n- 如需输出配置 JSON，请补充具体业务场景与三方入参/返参样例。",
+        EVALUATION_ROUTE: "【可行性评估】\n- 我会先判定可配置化、SPI扩展或不支持。\n\n【建议】\n- 请补充三方接口文档或完整出入参样例，评估会更准确。",
+    }
+    reply = fallback_replies.get(task_route, "【结论】\n- 这是配置生成场景。\n\n【说明】\n- 我会输出结构化 JSON 配置，并给出校验建议。")
     return {
         "shouldDisplay": True,
         "taskRoute": task_route,
@@ -138,195 +84,148 @@ def build_fallback_resolved(_user_input: str, plan: dict, resolved_mode: str) ->
     }
 
 
-def run_planning_stage(
-    console: Console,
-    llm,
-    input_text: str,
-    stream: bool,
-) -> tuple[dict, str, str, dict, Optional[str]]:
-    resolved_mode = "generate"
-    catalog = build_business_catalog()
-    planning_stream_started = False
+class PlanResolveAgent:
+    """Plan-and-Resolve Agent，async generator 产出 SSE 事件流"""
 
-    def on_planning_chunk(_: str):
-        nonlocal planning_stream_started
-        if stream and not planning_stream_started:
-            planning_stream_started = True
-            console.print("🫧 任务规划模型流式输出中...", markup=False, highlight=False)
+    def __init__(self):
+        self.llm = get_llm()
+        self.system_prompt = load_plan_system_prompts()
 
-    if stream:
-        console.print("🔎 正在识别任务与业务场景...", markup=False, highlight=False)
-    plan = run_with_progress(
-        console=console,
-        stream=stream,
-        stage="任务规划",
-        fn=lambda: plan_task(llm, input_text, catalog, debug_prompt=True, on_chunk=on_planning_chunk),
-    )
-    if not isinstance(plan, dict):
-        plan = build_fallback_plan(input_text, resolved_mode, catalog)
-    normalized_route = normalize_task_route(plan, resolved_mode)
-    plan["taskRoute"] = normalized_route
-    plan["resolveSteps"] = normalize_resolve_steps(plan)
-    if stream:
-        console.print(
-            f"✅ 规划完成：任务={plan.get('taskRoute', '未知')} | 场景={plan.get('scenarioName', '未知')} | 子任务数={len(plan.get('resolveSteps', []))}",
-            markup=False,
-            highlight=False,
-        )
-    if normalized_route == AUTO_CONFIG_ROUTE:
-        resolved_mode = "mcp"
-    business_file = None if normalized_route == QA_ROUTE else plan.get("businessFile")
-    business_context, jarvis_params, business_file_path = load_business_context_by_file(business_file)
-    return plan, resolved_mode, business_context, jarvis_params, business_file_path
+    async def run(self, input_text: str) -> AsyncGenerator[SSEEvent, None]:
+        """对外唯一入口，yield SSE 事件"""
+        # === Plan 阶段（JSON输出，静默收集，不流式给前端） ===
+        yield thinking("正在分析任务...")
 
+        try:
+            runnable, payload = build_plan_chain(self.llm, input_text, self.system_prompt)
+            plan_full_text = ""
+            async for chunk in astream_llm_chunks(runnable, payload):
+                plan_full_text += chunk
+            logger.info("LLM plan 响应=%s", plan_full_text)
+            plan_result = extract_plan_output(plan_full_text)
+            normalized_route = normalize_task_route(plan_result, "generate")
+            plan_result["taskRoute"] = normalized_route
+            plan_result["resolveSteps"] = normalize_resolve_steps(plan_result)
+        except Exception as exc:
+            logger.exception("Plan阶段失败: %s", exc)
+            yield error(f"任务规划失败：{exc}")
+            yield done()
+            return
 
-def run_execution_stage(
-    console: Console,
-    llm,
-    input_text: str,
-    stream: bool,
-    plan: dict,
-    resolved_mode: str,
-    system_prompt: str,
-    business_context: str,
-    jarvis_params: dict,
-) -> tuple[dict, dict | None, dict | None, str, str]:
-    steps = normalize_resolve_steps(plan)
-    step_results: list[dict] = []
-    latest_config: dict | None = None
-    latest_need_mcp = False
-    task_route = str(plan.get("taskRoute", ""))
-    if stream:
-        console.print("🧠 正在按计划逐步执行...", markup=False, highlight=False)
-    for step in steps:
-        step_name = step.get("stepName", "未命名步骤")
-        resolve_stream_started = False
-
-        def on_resolve_chunk(_: str):
-            nonlocal resolve_stream_started
-            if stream and not resolve_stream_started:
-                resolve_stream_started = True
-                console.print(f"🫧 步骤{step.get('stepNo')}模型流式输出中...", markup=False, highlight=False)
-
-        if stream:
-            console.print(f"➡️ 执行步骤 {step.get('stepNo')}：{step_name}", markup=False, highlight=False)
-        step_mode = resolved_mode
-        if bool(step.get("needMcp")):
-            step_mode = "mcp"
-        step_resolved = run_with_progress(
-            console=console,
-            stream=stream,
-            stage=f"步骤{step.get('stepNo')}执行",
-            fn=lambda current_step=step: resolve_task(
-                llm=llm,
-                user_input=input_text,
-                mode=step_mode,
-                plan=plan,
-                system_prompt=system_prompt,
-                business_context=business_context,
-                jarvis_params=jarvis_params,
-                current_step=current_step,
-                previous_steps=step_results,
-                on_chunk=on_resolve_chunk,
-            ),
-        )
-        if not isinstance(step_resolved, dict):
-            step_resolved = build_fallback_resolved(input_text, {"taskRoute": step.get("taskRoute", task_route)}, step_mode)
-        normalized_step_route = normalize_task_route({"taskRoute": step_resolved.get("taskRoute", step.get("taskRoute", task_route))}, step_mode)
-        step_resolved["taskRoute"] = normalized_step_route
-        step_result_summary = {
-            "stepNo": step.get("stepNo"),
-            "stepName": step_name,
-            "taskRoute": normalized_step_route,
-            "reply": str(step_resolved.get("reply", "")),
-            "risk": str(step_resolved.get("risk", "")),
+        # 发送 plan 事件
+        plan_payload = {
+            "taskRoute": str(plan_result.get("taskRoute", "")),
+            "scenarioName": str(plan_result.get("scenarioName", "")),
+            "objective": str(plan_result.get("objective", "")),
+            "resolveSteps": plan_result.get("resolveSteps", []),
         }
-        step_results.append(step_result_summary)
-        maybe_config = step_resolved.get("config")
-        if isinstance(maybe_config, dict) and maybe_config:
-            latest_config = maybe_config
-            latest_need_mcp = bool(step_resolved.get("needMcp"))
-        task_route = normalized_step_route
-    if not step_results:
-        resolved = build_fallback_resolved(input_text, plan, resolved_mode)
-    else:
-        step_lines = [f"{item['stepNo']}. {item['stepName']}" for item in steps]
-        reply_parts = ["【执行计划】", *step_lines, "", "【分步结果】"]
-        for item in step_results:
-            reply_parts.append(
-                f"步骤{item['stepNo']}（{item['stepName']}）\n{item['reply']}"
+        yield plan(plan_payload)
+
+        # === Resolve 阶段（JSON输出，收集完解析后只把 reply 流式给前端） ===
+        resolved_mode = "mcp" if str(plan_result.get("taskRoute", "")).strip() == AUTO_CONFIG_ROUTE else "generate"
+        business_file = None if str(plan_result.get("taskRoute", "")).strip() == QA_ROUTE else plan_result.get("businessFile")
+        business_context, jarvis_params, business_file_path = load_business_context_by_file(business_file)
+
+        steps = normalize_resolve_steps(plan_result)
+        step_results: list[dict] = []
+        latest_config: dict | None = None
+        latest_need_mcp = False
+        task_route = str(plan_result.get("taskRoute", ""))
+
+        for step in steps:
+            step_name = step.get("stepName", "未命名步骤")
+            step_no = step.get("stepNo", 0)
+            yield thinking(f"执行步骤{step_no}：{step_name}")
+
+            step_mode = resolved_mode
+            if bool(step.get("needMcp")):
+                step_mode = "mcp"
+
+            try:
+                runnable, payload, step_route, need_mcp_default = build_resolve_chain(
+                    llm=self.llm,
+                    user_input=input_text,
+                    mode=step_mode,
+                    plan=plan_result,
+                    system_prompt=self.system_prompt,
+                    business_context=business_context,
+                    jarvis_params=jarvis_params,
+                    current_step=step,
+                    previous_steps=step_results,
+                )
+                resolve_full_text = ""
+                async for chunk in astream_llm_chunks(runnable, payload):
+                    resolve_full_text += chunk
+                step_resolved = parse_resolve_output(resolve_full_text, step_route, need_mcp_default)
+                # 只把解析后的 reply 发送给前端
+                reply_text = str(step_resolved.get("reply", ""))
+                if reply_text:
+                    yield content(reply_text)
+            except Exception as exc:
+                logger.exception("Resolve步骤%d失败: %s", step_no, exc)
+                step_resolved = build_fallback_resolved(
+                    {"taskRoute": step.get("taskRoute", task_route)}, step_mode
+                )
+
+            if not isinstance(step_resolved, dict):
+                step_resolved = build_fallback_resolved(
+                    {"taskRoute": step.get("taskRoute", task_route)}, step_mode
+                )
+
+            normalized_step_route = normalize_task_route(
+                {"taskRoute": step_resolved.get("taskRoute", step.get("taskRoute", task_route))},
+                step_mode,
             )
-        resolved = {
+            step_resolved["taskRoute"] = normalized_step_route
+
+            step_result_summary = {
+                "stepNo": step_no,
+                "stepName": step_name,
+                "taskRoute": normalized_step_route,
+                "reply": str(step_resolved.get("reply", "")),
+                "risk": str(step_resolved.get("risk", "")),
+            }
+            step_results.append(step_result_summary)
+
+            maybe_config = step_resolved.get("config")
+            if isinstance(maybe_config, dict) and maybe_config:
+                latest_config = maybe_config
+                latest_need_mcp = bool(step_resolved.get("needMcp"))
+            task_route = normalized_step_route
+
+        # === MCP 工具调用 ===
+        resolved = self._build_final_reply(steps, step_results, plan_result, resolved_mode, task_route, latest_config, latest_need_mcp)
+        config = resolved.get("config") if isinstance(resolved, dict) else None
+        need_mcp = bool(resolved.get("needMcp")) if isinstance(resolved, dict) else False
+        if isinstance(config, dict) and (need_mcp or resolved_mode == "mcp" or task_route == AUTO_CONFIG_ROUTE):
+            yield thinking("正在调用MCP工具...")
+            try:
+                mcp_results = execute_mcp_sync(config)
+            except Exception as exc:
+                mcp_results = {"error": str(exc)}
+            yield tool_call("mcp", config, mcp_results)
+
+        # === 完成 ===
+        yield done({
+            "mode": resolved_mode,
+            "taskRoute": task_route,
+            "businessFile": business_file_path if business_file else None,
+        })
+
+    @staticmethod
+    def _build_final_reply(
+        steps: list[dict], step_results: list[dict], plan_result: dict,
+        resolved_mode: str, task_route: str,
+        latest_config: dict | None, latest_need_mcp: bool,
+    ) -> dict:
+        """组装最终结果 dict（用于 MCP 判断等）"""
+        if not step_results:
+            return build_fallback_resolved(plan_result, resolved_mode)
+        return {
             "shouldDisplay": True,
             "taskRoute": task_route,
-            "reply": "\n\n".join(reply_parts).strip(),
             "needMcp": latest_need_mcp,
             "config": latest_config or {},
-            "risk": "；".join([item["risk"] for item in step_results if item.get("risk")]),
+            "risk": "；".join([r["risk"] for r in step_results if r.get("risk")]),
             "stepResults": step_results,
         }
-    config = resolved.get("config") if isinstance(resolved, dict) else None
-    need_mcp = bool(resolved.get("needMcp")) if isinstance(resolved, dict) else False
-    mcp_results = None
-    if isinstance(config, dict) and (need_mcp or resolved_mode == "mcp" or task_route == AUTO_CONFIG_ROUTE):
-        try:
-            mcp_results = execute_mcp_sync(config)
-        except Exception as exc:
-            mcp_results = {"error": str(exc)}
-    should_display = bool(resolved.get("shouldDisplay", True)) if isinstance(resolved, dict) else True
-    reply = resolved.get("reply", "") if isinstance(resolved, dict) else ""
-    if not reply:
-        reply = "【结果】\n- 已完成任务执行，但未生成可展示内容。"
-    if not should_display:
-        reply = "【结果】\n- 当前结果不建议直接展示给用户，请补充输入信息后重试。"
-    if mcp_results:
-        reply = f"{reply}\n\n【MCP执行结果】\n```json\n{json.dumps(mcp_results, ensure_ascii=False, indent=2)}\n```"
-    if stream:
-        console.print(reply, markup=False, highlight=False)
-    return resolved, config, mcp_results, task_route, reply
-
-
-def run_plan_and_resolve(console: Console, input_text: str, stream: bool) -> dict:
-    llm = get_llm(console)
-    if not llm:
-        raise typer.Exit(1)
-    system_prompt = load_plan_system_prompts()
-    plan, resolved_mode, business_context, jarvis_params, business_file_path = run_planning_stage(
-        console=console,
-        llm=llm,
-        input_text=input_text,
-        stream=stream,
-    )
-    if stream:
-        plan_payload = {
-            "taskRoute": str(plan.get("taskRoute", "")),
-            "scenarioName": str(plan.get("scenarioName", "")),
-            "objective": str(plan.get("objective", "")),
-            "resolveSteps": plan.get("resolveSteps", []),
-        }
-        console.print(
-            f"<<<PLAN_JSON>>>{json.dumps(plan_payload, ensure_ascii=False)}<<<END_PLAN_JSON>>>",
-            markup=False,
-            highlight=False,
-        )
-    resolved, config, mcp_results, task_route, reply = run_execution_stage(
-        console=console,
-        llm=llm,
-        input_text=input_text,
-        stream=stream,
-        plan=plan,
-        resolved_mode=resolved_mode,
-        system_prompt=system_prompt,
-        business_context=business_context,
-        jarvis_params=jarvis_params,
-    )
-    return {
-        "mode": resolved_mode,
-        "taskRoute": task_route,
-        "plan": plan,
-        "businessFile": business_file_path,
-        "resolved": resolved,
-        "config": config,
-        "mcpResults": mcp_results,
-        "display": reply,
-    }
