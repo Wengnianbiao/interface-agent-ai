@@ -1,16 +1,24 @@
+"""LLM Chain 构建与输出解析 — Plan / Resolve 阶段的 prompt 模板和解析逻辑"""
+
 import json
 import re
 import logging
 from typing import Any, AsyncGenerator
-from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
+
+from langchain_core.prompts import (
+    ChatPromptTemplate,
+    SystemMessagePromptTemplate,
+    HumanMessagePromptTemplate,
+)
+
 from backend.app.agents.utils import extract_json_text, parse_json
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
-)
 logger = logging.getLogger("interface-agent-llm")
-PLAN_REQUIRED_KEYS = {"taskRoute", "scenarioName", "businessFile", "objective", "needMcp", "shouldAskUser", "resolveSteps"}
+
+PLAN_REQUIRED_KEYS = {
+    "taskRoute", "scenarioName", "businessFile",
+    "objective", "needMcp", "shouldAskUser", "resolveSteps",
+}
 
 
 def _stringify_stream_content(content: Any) -> str:
@@ -31,7 +39,6 @@ def _stringify_stream_content(content: Any) -> str:
 
 
 async def astream_llm_chunks(runnable, payload: dict) -> AsyncGenerator[str, None]:
-    """异步流式调用LLM，逐chunk yield文本片段"""
     async for chunk in runnable.astream(payload):
         text_chunk = _stringify_stream_content(getattr(chunk, "content", ""))
         if text_chunk:
@@ -58,7 +65,6 @@ def extract_plan_output(response_content: str) -> dict:
 
 
 def build_plan_chain(llm, user_input: str, system_prompt: str) -> tuple:
-    """构建 Plan 阶段的 chain 和 payload，返回 (runnable, payload)"""
     planner_prompt = ChatPromptTemplate(
         messages=[
             SystemMessagePromptTemplate.from_template(
@@ -83,7 +89,11 @@ def build_plan_chain(llm, user_input: str, system_prompt: str) -> tuple:
     }
     formatted_messages = planner_prompt.format_messages(**payload)
     for message in formatted_messages:
-        logger.info("[Plan Prompt][%s] %s", getattr(message, 'type', 'unknown'), message.content[:500])
+        logger.info(
+            "[Plan Prompt][%s] %s",
+            getattr(message, "type", "unknown"),
+            message.content[:500],
+        )
     return planner_prompt | llm, payload
 
 
@@ -91,17 +101,20 @@ def build_resolve_chain(
     llm,
     user_input: str,
     mode: str,
-    plan: dict,
+    plan_dict: dict,
     system_prompt: str,
     business_context: str,
     jarvis_params: dict,
     current_step: dict,
     previous_steps: list[dict],
 ) -> tuple:
-    """构建 Resolve 阶段的 chain 和 payload，返回 (runnable, payload, step_route, need_mcp_default)"""
-    expected_route = str(plan.get("taskRoute", ""))
+    expected_route = str(plan_dict.get("taskRoute", ""))
     step_route = str(current_step.get("taskRoute", expected_route))
-    need_mcp_default = bool(current_step.get("needMcp")) or mode == "mcp" or step_route == "自动化配置"
+    need_mcp_default = (
+        bool(current_step.get("needMcp"))
+        or mode == "mcp"
+        or step_route == "自动化配置"
+    )
     resolver_prompt = ChatPromptTemplate(
         messages=[
             SystemMessagePromptTemplate.from_template(
@@ -130,7 +143,7 @@ def build_resolve_chain(
     payload = {
         "system_prompt": system_prompt,
         "business_context": business_context,
-        "plan": json.dumps(plan, ensure_ascii=False),
+        "plan": json.dumps(plan_dict, ensure_ascii=False),
         "current_step": json.dumps(current_step, ensure_ascii=False),
         "previous_steps": json.dumps(previous_steps, ensure_ascii=False),
         "jarvis_input": json.dumps(jarvis_params.get("input"), ensure_ascii=False),
@@ -141,8 +154,49 @@ def build_resolve_chain(
     return resolver_prompt | llm, payload, step_route, need_mcp_default
 
 
-def parse_resolve_output(response_content: str, step_route: str, need_mcp_default: bool) -> dict:
-    """解析 Resolve 阶段 LLM 的完整输出文本为结构化 dict"""
+def build_final_answer_chain(
+    llm,
+    user_input: str,
+    system_prompt: str,
+    plan_dict: dict,
+    step_results: list[dict],
+    business_context: str,
+) -> tuple:
+    """基于所有步骤的执行结果，生成面向用户的最终回答（流式自然语言）"""
+    answer_prompt = ChatPromptTemplate(
+        messages=[
+            SystemMessagePromptTemplate.from_template(
+                "{system_prompt}\n\n"
+                "你现在处于最终回答阶段。"
+                "前面的 Plan 和 Resolve 步骤已经全部完成，下面提供了所有步骤的执行结果。"
+                "请你根据这些结果，给用户一个完整、清晰、结构化的最终回答。"
+                "直接用自然语言回答，不要输出 JSON。"
+                "回答要专业、有条理，可以使用 Markdown 格式（标题、列表、代码块等）。"
+                "如果步骤结果中包含配置 JSON，请在回答中以代码块形式展示。"
+                "如果有风险提示，也一并说明。"
+            ),
+            HumanMessagePromptTemplate.from_template(
+                "业务场景上下文:\n{business_context}\n\n"
+                "任务规划:\n{plan}\n\n"
+                "各步骤执行结果:\n{step_results}\n\n"
+                "用户原始问题:\n{input}\n\n"
+                "请给出最终回答。"
+            ),
+        ]
+    )
+    payload = {
+        "system_prompt": system_prompt,
+        "business_context": business_context,
+        "plan": json.dumps(plan_dict, ensure_ascii=False),
+        "step_results": json.dumps(step_results, ensure_ascii=False),
+        "input": user_input,
+    }
+    return answer_prompt | llm, payload
+
+
+def parse_resolve_output(
+    response_content: str, step_route: str, need_mcp_default: bool
+) -> dict:
     logger.info("LLM resolve 响应=%s", response_content)
     parsed, _ = parse_json(extract_json_text(response_content))
     if parsed and isinstance(parsed, dict) and "reply" in parsed:
@@ -157,16 +211,20 @@ def parse_resolve_output(response_content: str, step_route: str, need_mcp_defaul
         if "shouldDisplay" not in parsed:
             parsed["shouldDisplay"] = True
         return parsed
+
     json_blocks = re.findall(r"```json\s*([\s\S]*?)```", response_content)
     parsed_config = {}
     for block in json_blocks:
         maybe_config, _ = parse_json(block.strip())
         if isinstance(maybe_config, dict):
-            if {"shouldDisplay", "taskRoute", "reply", "needMcp", "config", "risk"}.issubset(set(maybe_config.keys())):
+            if {"shouldDisplay", "taskRoute", "reply", "needMcp", "config", "risk"}.issubset(
+                set(maybe_config.keys())
+            ):
                 return maybe_config
             parsed_config = maybe_config
             break
-    fallback_payload: dict[str, Any] = {
+
+    return {
         "shouldDisplay": True,
         "taskRoute": step_route,
         "reply": response_content.strip(),
@@ -174,4 +232,3 @@ def parse_resolve_output(response_content: str, step_route: str, need_mcp_defaul
         "config": parsed_config,
         "risk": "",
     }
-    return fallback_payload

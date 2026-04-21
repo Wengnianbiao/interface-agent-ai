@@ -23,15 +23,20 @@ class SSEEvent:
     data: Any
 
     def encode(self) -> str:
-        """编码为SSE协议格式: event: xxx\ndata: xxx\n\n"""
+        """编码为SSE协议格式，多行 data 按规范每行加 data: 前缀"""
         if isinstance(self.data, (dict, list)):
             data_str = json.dumps(self.data, ensure_ascii=False)
         else:
             data_str = str(self.data)
-        return f"event: {self.event.value}\ndata: {data_str}\n\n"
+        data_lines = data_str.split("\n")
+        data_part = "\n".join(f"data: {line}" for line in data_lines)
+        return f"event: {self.event.value}\n{data_part}\n\n"
 
-def thinking(message: str) -> SSEEvent:
-    return SSEEvent(SSEEventType.THINKING, {"message": message})
+def thinking(message: str, phase: str = "init", step_no: int | None = None) -> SSEEvent:
+    data: dict[str, Any] = {"message": message, "phase": phase}
+    if step_no is not None:
+        data["stepNo"] = step_no
+    return SSEEvent(SSEEventType.THINKING, data)
 
 def plan(plan_data: dict) -> SSEEvent:
     return SSEEvent(SSEEventType.PLAN, plan_data)

@@ -32,7 +32,7 @@ async def chat(
 
     logger.info("request_id=%s 收到请求", request_id)
     logger.info("request_id=%s session_id=%s 输入预览=%s",
-                request_id, session_id, request.prompt[:1000].replace("\n", " "))
+                request_id, session_id, request.prompt[:1000])
 
     try:
         stream = execute_chat_stream(request_id, request.prompt, session_id, current_user)

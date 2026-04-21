@@ -1,5 +1,8 @@
+"""LLM 客户端 — 单例模式，应用生命周期内复用"""
+
 import os
 import logging
+from functools import lru_cache
 from langchain_openai import ChatOpenAI
 
 logger = logging.getLogger("interface-agent-llm")
@@ -10,9 +13,10 @@ class LLMConfigError(Exception):
     pass
 
 
+@lru_cache(maxsize=1)
 def get_llm() -> ChatOpenAI:
     """
-    构造LLM客户端。
+    构造LLM客户端（单例）。
     配置来源：环境变量。配置非法时抛出 LLMConfigError。
     """
     logging.getLogger("httpx").setLevel(logging.WARNING)

@@ -24,19 +24,19 @@ const sessionRecords = ref([])
 const isLoadingSessions = ref(false)
 const sessionLoadError = ref('')
 const activeSessionId = ref('')
-const planStartMarker = '<<<PLAN_JSON>>>'
-const planEndMarker = '<<<END_PLAN_JSON>>>'
 const sessionId = ref((typeof crypto !== 'undefined' && crypto.randomUUID)
   ? crypto.randomUUID()
   : `${Date.now()}-${Math.random().toString(36).slice(2)}`)
 
-// 清空消息
+const generateSessionId = () =>
+  (typeof crypto !== 'undefined' && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+
 const clearMessages = () => {
   messages.value = []
   activeSessionId.value = ''
-  sessionId.value = (typeof crypto !== 'undefined' && crypto.randomUUID)
-    ? crypto.randomUUID()
-    : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  sessionId.value = generateSessionId()
 }
 
 const toggleSidebar = () => {
@@ -48,9 +48,7 @@ const logout = () => {
   inputPrompt.value = ''
   sessionRecords.value = []
   activeSessionId.value = ''
-  sessionId.value = (typeof crypto !== 'undefined' && crypto.randomUUID)
-    ? crypto.randomUUID()
-    : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  sessionId.value = generateSessionId()
   emit('logout')
 }
 
@@ -112,23 +110,6 @@ const formatSessionMeta = (record) => {
   return `${qa}轮对话`
 }
 
-const extractPlanPayload = (text) => {
-  const start = text.indexOf(planStartMarker)
-  const end = text.indexOf(planEndMarker)
-  if (start === -1 || end === -1 || end <= start) {
-    return { cleanText: text, plan: null }
-  }
-  const jsonText = text.slice(start + planStartMarker.length, end).trim()
-  let plan = null
-  try {
-    plan = JSON.parse(jsonText)
-  } catch (_error) {
-    plan = null
-  }
-  const cleaned = `${text.slice(0, start)}${text.slice(end + planEndMarker.length)}`.trim()
-  return { cleanText: cleaned, plan }
-}
-
 const escapeHtml = (value) => value
   .replaceAll('&', '&amp;')
   .replaceAll('<', '&lt;')
@@ -169,6 +150,7 @@ const renderMarkdownText = (content) => {
   const blocks = []
   const paragraph = []
   const listItems = []
+  let listType = 'ul'
   let i = 0
 
   const flushParagraph = () => {
@@ -179,9 +161,11 @@ const renderMarkdownText = (content) => {
 
   const flushList = () => {
     if (!listItems.length) return
+    const tag = listType
     const items = listItems.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join('')
-    blocks.push(`<ul>${items}</ul>`)
+    blocks.push(`<${tag}>${items}</${tag}>`)
     listItems.length = 0
+    listType = 'ul'
   }
 
   while (i < lines.length) {
@@ -190,6 +174,14 @@ const renderMarkdownText = (content) => {
     if (!trimmed) {
       flushParagraph()
       flushList()
+      i += 1
+      continue
+    }
+
+    if (/^-{3,}$/.test(trimmed) || /^\*{3,}$/.test(trimmed)) {
+      flushParagraph()
+      flushList()
+      blocks.push('<hr>')
       i += 1
       continue
     }
@@ -204,8 +196,20 @@ const renderMarkdownText = (content) => {
       continue
     }
 
+    const orderedMatch = /^(\d+)[.)]\s+(.*)$/.exec(trimmed)
+    if (orderedMatch) {
+      flushParagraph()
+      if (listItems.length && listType !== 'ol') flushList()
+      listType = 'ol'
+      listItems.push(orderedMatch[2])
+      i += 1
+      continue
+    }
+
     if (/^([-*])\s+/.test(trimmed)) {
       flushParagraph()
+      if (listItems.length && listType !== 'ul') flushList()
+      listType = 'ul'
       listItems.push(trimmed.replace(/^([-*])\s+/, ''))
       i += 1
       continue
@@ -238,7 +242,6 @@ const renderMarkdownText = (content) => {
   return blocks.join('')
 }
 
-// 滚动到底部
 const scrollToBottom = () => {
   nextTick(() => {
     if (messagesContainerRef.value) {
@@ -247,7 +250,6 @@ const scrollToBottom = () => {
   })
 }
 
-// 自动调整文本框高度
 const autoResizeTextarea = () => {
   const textarea = textareaRef.value
   if (textarea) {
@@ -256,7 +258,6 @@ const autoResizeTextarea = () => {
   }
 }
 
-// 监听输入变化
 watch(inputPrompt, () => {
   nextTick(() => {
     autoResizeTextarea()
@@ -276,32 +277,40 @@ onMounted(async () => {
   await fetchSessionRecords()
 })
 
-// SSE事件解析器
 const parseSSEEvents = (text) => {
   const events = []
-  // 按双换行分割事件块
   const blocks = text.split('\n\n')
   for (const block of blocks) {
     const trimmed = block.trim()
     if (!trimmed) continue
     let eventType = 'message'
-    let data = ''
+    const dataLines = []
     const lines = trimmed.split('\n')
     for (const line of lines) {
       if (line.startsWith('event: ')) {
         eventType = line.slice(7).trim()
       } else if (line.startsWith('data: ')) {
-        data = line.slice(6)
+        dataLines.push(line.slice(6))
+      } else if (line.startsWith('data:')) {
+        dataLines.push(line.slice(5))
       }
     }
-    if (data) {
-      events.push({ event: eventType, data })
+    if (dataLines.length > 0) {
+      events.push({ event: eventType, data: dataLines.join('\n') })
     }
   }
   return events
 }
 
-// 发送消息
+const PHASE_LABELS = {
+  context: '分析需求',
+  plan: '制定计划',
+  resolve: '执行任务',
+  tool: '调用工具',
+  step_done: '步骤完成',
+  answer: '生成回答',
+}
+
 const sendMessage = async () => {
   if (!inputPrompt.value.trim() || isLoading.value) return
 
@@ -317,6 +326,24 @@ const sendMessage = async () => {
   })
 
   isLoading.value = true
+
+  const ensureAssistantMessage = () => {
+    if (aiMessageIndex === -1) {
+      aiMessageIndex = messages.value.length
+      messages.value.push({
+        role: 'assistant',
+        content: '',
+        thinkingPhase: null,
+        thinkingMessage: '',
+        plan: null,
+        toolCalls: [],
+        errorMessage: null,
+        doneData: null,
+      })
+      isLoading.value = false
+    }
+    return messages.value[aiMessageIndex]
+  }
 
   try {
     const response = await fetch(`${API_BASE_URL}/api/chat`, {
@@ -344,7 +371,6 @@ const sendMessage = async () => {
 
       sseBuffer += decoder.decode(value, { stream: true })
 
-      // 尝试解析完整的SSE事件
       const lastDoubleNewline = sseBuffer.lastIndexOf('\n\n')
       if (lastDoubleNewline === -1) continue
 
@@ -354,82 +380,89 @@ const sendMessage = async () => {
       const events = parseSSEEvents(completePart)
       for (const evt of events) {
         if (evt.event === 'thinking') {
-          // 阶段状态 - 创建或更新AI消息
-          let msg = ''
-          try { msg = JSON.parse(evt.data).message } catch { msg = evt.data }
-          if (aiMessageIndex === -1) {
-            aiMessageIndex = messages.value.length
-            messages.value.push({ role: 'assistant', content: '', thinking: msg, plan: null })
-            isLoading.value = false
-          } else {
-            messages.value[aiMessageIndex].thinking = msg
+          let parsed = {}
+          try { parsed = JSON.parse(evt.data) } catch { parsed = { message: evt.data, phase: 'init' } }
+          const msg = ensureAssistantMessage()
+          msg.thinkingPhase = parsed.phase || 'init'
+          msg.thinkingMessage = parsed.message || ''
+
+          if (parsed.phase === 'resolve' && parsed.stepNo && msg.plan) {
+            const steps = msg.plan.resolveSteps || []
+            steps.forEach((s) => {
+              if (s.stepNo === parsed.stepNo) s.status = 'running'
+            })
+          }
+          if (parsed.phase === 'step_done' && parsed.stepNo && msg.plan) {
+            const steps = msg.plan.resolveSteps || []
+            steps.forEach((s) => {
+              if (s.stepNo === parsed.stepNo) s.status = 'done'
+            })
           }
         } else if (evt.event === 'plan') {
           let planData = null
           try { planData = JSON.parse(evt.data) } catch { /* ignore */ }
-          if (aiMessageIndex === -1) {
-            aiMessageIndex = messages.value.length
-            messages.value.push({ role: 'assistant', content: '', plan: planData })
-            isLoading.value = false
-          } else {
-            messages.value[aiMessageIndex].plan = planData
+          const msg = ensureAssistantMessage()
+          if (planData && planData.resolveSteps) {
+            planData.resolveSteps = planData.resolveSteps.map((s) => ({ ...s, status: 'pending' }))
           }
+          msg.plan = planData
+          msg.thinkingPhase = null
         } else if (evt.event === 'content') {
           contentText += evt.data
-          if (aiMessageIndex === -1) {
-            aiMessageIndex = messages.value.length
-            messages.value.push({ role: 'assistant', content: contentText, plan: null })
-            isLoading.value = false
-          } else {
-            messages.value[aiMessageIndex].content = contentText
-            messages.value[aiMessageIndex].thinking = null
-          }
+          const msg = ensureAssistantMessage()
+          msg.content = contentText
+          msg.thinkingPhase = null
         } else if (evt.event === 'tool_call') {
           let toolData = null
           try { toolData = JSON.parse(evt.data) } catch { /* ignore */ }
-          if (aiMessageIndex !== -1 && toolData) {
-            const resultJson = JSON.stringify(toolData.result || {}, null, 2)
-            contentText += `\n\n\u3010MCP\u6267\u884c\u7ed3\u679c\u3011\n\`\`\`json\n${resultJson}\n\`\`\``
-            messages.value[aiMessageIndex].content = contentText
+          const msg = ensureAssistantMessage()
+          if (toolData) {
+            msg.toolCalls.push({
+              tool: toolData.tool || 'unknown',
+              payload: toolData.payload || {},
+              result: toolData.result || {},
+              collapsed: true,
+            })
           }
+          msg.thinkingPhase = null
         } else if (evt.event === 'error') {
           let errMsg = ''
           try { errMsg = JSON.parse(evt.data).message } catch { errMsg = evt.data }
-          if (aiMessageIndex === -1) {
-            aiMessageIndex = messages.value.length
-            messages.value.push({ role: 'assistant', content: `\u274c ${errMsg}` })
-            isLoading.value = false
-          } else {
-            messages.value[aiMessageIndex].content += `\n\n\u274c ${errMsg}`
+          const msg = ensureAssistantMessage()
+          msg.errorMessage = errMsg
+          msg.thinkingPhase = null
+        } else if (evt.event === 'done') {
+          let doneData = {}
+          try { doneData = JSON.parse(evt.data) } catch { /* ignore */ }
+          const msg = ensureAssistantMessage()
+          msg.doneData = doneData
+          msg.thinkingPhase = null
+          if (msg.plan && msg.plan.resolveSteps) {
+            msg.plan.resolveSteps.forEach((s) => {
+              if (s.status !== 'done') s.status = 'done'
+            })
           }
         }
-        // done event - 不需要额外处理
       }
       scrollToBottom()
     }
   } catch (error) {
     console.error('请求失败:', error)
-    if (aiMessageIndex === -1) {
-      messages.value.push({ role: 'assistant', content: `\u274c \u8bf7\u6c42\u5931\u8d25\uff1a${error.message}` })
-    } else {
-      messages.value[aiMessageIndex].content = `\u274c \u8bf7\u6c42\u5931\u8d25\uff1a${error.message}`
-    }
+    const msg = ensureAssistantMessage()
+    msg.errorMessage = `请求失败：${error.message}`
   } finally {
     isLoading.value = false
     await fetchSessionRecords()
   }
 }
 
-// 解析 Markdown 代码块 - 支持未完成的代码块（流式输出）
 const parseContent = (content) => {
   const parts = []
   const regex = /```(\w+)?\n([\s\S]*?)```/g
   let lastIndex = 0
   let match
   
-  // 处理已完成的代码块
   while ((match = regex.exec(content)) !== null) {
-    // 添加代码块前的文本
     if (match.index > lastIndex) {
       parts.push({
         type: 'text',
@@ -437,25 +470,19 @@ const parseContent = (content) => {
         html: renderMarkdownText(content.substring(lastIndex, match.index))
       })
     }
-    
-    // 添加已完成的代码块
     parts.push({
       type: 'code',
       language: match[1] || 'text',
       content: match[2],
       completed: true
     })
-    
     lastIndex = regex.lastIndex
   }
   
-  // 处理剩余内容（可能包含未完成的代码块）
   const remaining = content.substring(lastIndex)
   if (remaining) {
-    // 检测未完成的代码块（只有开始标记，没有结束标记）
     const incompleteMatch = /```(\w+)?\n([\s\S]*)$/.exec(remaining)
     if (incompleteMatch) {
-      // 添加代码块前的文本
       const beforeCode = remaining.substring(0, incompleteMatch.index)
       if (beforeCode) {
         parts.push({
@@ -464,16 +491,13 @@ const parseContent = (content) => {
           html: renderMarkdownText(beforeCode)
         })
       }
-      
-      // 添加未完成的代码块
       parts.push({
         type: 'code',
         language: incompleteMatch[1] || 'text',
         content: incompleteMatch[2],
-        completed: false  // 标记为未完成
+        completed: false
       })
     } else {
-      // 正常文本
       parts.push({
         type: 'text',
         content: remaining,
@@ -485,14 +509,27 @@ const parseContent = (content) => {
   return parts.length > 0 ? parts : [{ type: 'text', content, html: renderMarkdownText(content) }]
 }
 
-// 复制代码
 const copyCode = async (code) => {
   try {
     await navigator.clipboard.writeText(code)
-    console.log('复制成功')
   } catch (err) {
     console.error('复制失败:', err)
   }
+}
+
+const toggleToolCollapse = (toolCall) => {
+  toolCall.collapsed = !toolCall.collapsed
+}
+
+const routeTagClass = (route) => {
+  const map = {
+    '自动化配置': 'tag-auto',
+    '规则问答': 'tag-qa',
+    '可行性评估': 'tag-eval',
+    'SPI扩展': 'tag-spi',
+    '配置生成': 'tag-config',
+  }
+  return map[route] || 'tag-default'
 }
 </script>
 
@@ -544,6 +581,14 @@ const copyCode = async (code) => {
     <main class="main-content">
       <div class="messages-container" ref="messagesContainerRef">
           <div v-if="messages.length === 0" class="empty-state">
+            <div class="empty-icon">
+              <svg width="48" height="48" viewBox="0 0 24 24" fill="none">
+                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z" fill="#e8eaff"/>
+                <path d="M8 14s1.5 2 4 2 4-2 4-2" stroke="#6366f1" stroke-width="1.5" stroke-linecap="round"/>
+                <circle cx="9" cy="10" r="1.2" fill="#6366f1"/>
+                <circle cx="15" cy="10" r="1.2" fill="#6366f1"/>
+              </svg>
+            </div>
             <h1>接口AI助手</h1>
             <p>请输入厂商接口信息，AI 将为您完成全流程配置</p>
           </div>
@@ -553,35 +598,89 @@ const copyCode = async (code) => {
             :key="index"
             :class="['message', message.role]"
           >
+            <!-- 用户消息 -->
             <div v-if="message.role === 'user'" class="user-text">{{ message.content }}</div>
             
+            <!-- AI 消息 -->
             <template v-else>
               <div class="message-avatar">
                 <div class="avatar ai-avatar">AI</div>
               </div>
               <div class="message-content">
-                <div v-if="message.thinking" class="thinking-status">
-                  <span class="thinking-indicator">{{ message.thinking }}</span>
+
+                <!-- Thinking 状态指示器 -->
+                <div v-if="message.thinkingPhase" class="thinking-card">
+                  <div class="thinking-pulse"></div>
+                  <div class="thinking-body">
+                    <span class="thinking-label">{{ message.thinkingMessage }}</span>
+                  </div>
                 </div>
+
+                <!-- Plan 执行计划卡片 -->
                 <div v-if="message.plan" class="plan-card">
-                  <div class="plan-card-title">执行计划</div>
-                  <div class="plan-card-subtitle">
-                    <span>{{ message.plan.scenarioName || '通用场景' }}</span>
-                    <span class="plan-card-dot">•</span>
-                    <span>{{ message.plan.taskRoute || '默认路线' }}</span>
+                  <div class="plan-card-header">
+                    <div class="plan-card-icon">
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+                        <path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        <rect x="9" y="3" width="6" height="4" rx="1" stroke="currentColor" stroke-width="2"/>
+                      </svg>
+                    </div>
+                    <div class="plan-card-titles">
+                      <div class="plan-card-title">执行计划</div>
+                      <div class="plan-card-subtitle">
+                        <span :class="['route-tag', routeTagClass(message.plan.taskRoute)]">{{ message.plan.taskRoute || '默认路线' }}</span>
+                        <span class="plan-scenario">{{ message.plan.scenarioName || '通用场景' }}</span>
+                      </div>
+                    </div>
                   </div>
                   <div v-if="message.plan.objective" class="plan-card-objective">{{ message.plan.objective }}</div>
                   <div class="plan-steps">
-                    <div v-for="step in message.plan.resolveSteps || []" :key="step.stepNo" class="plan-step">
-                      <div class="plan-step-index">{{ step.stepNo }}</div>
+                    <div 
+                      v-for="step in message.plan.resolveSteps || []" 
+                      :key="step.stepNo" 
+                      :class="['plan-step', `step-${step.status || 'pending'}`]"
+                    >
+                      <div :class="['plan-step-status', `status-${step.status || 'pending'}`]">
+                        <svg v-if="!step.status || step.status === 'pending'" width="14" height="14" viewBox="0 0 24 24" fill="none">
+                          <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/>
+                        </svg>
+                        <div v-else-if="step.status === 'running'" class="step-spinner"></div>
+                        <svg v-else-if="step.status === 'done'" width="14" height="14" viewBox="0 0 24 24" fill="none">
+                          <circle cx="12" cy="12" r="9" fill="#10b981" stroke="#10b981" stroke-width="2"/>
+                          <path d="M8 12l2.5 3L16 9" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                      </div>
                       <div class="plan-step-body">
                         <div class="plan-step-name">{{ step.stepName }}</div>
                         <div class="plan-step-meta">{{ step.objective }}</div>
                       </div>
                     </div>
                   </div>
+                  <!-- 进度条 -->
+                  <div v-if="message.plan.resolveSteps?.length" class="plan-progress">
+                    <div 
+                      class="plan-progress-bar" 
+                      :style="{ width: Math.round((message.plan.resolveSteps.filter(s => s.status === 'done').length / message.plan.resolveSteps.length) * 100) + '%' }"
+                    ></div>
+                  </div>
                 </div>
-                <div class="assistant-text">
+
+                <!-- 错误提示卡片 -->
+                <div v-if="message.errorMessage" class="error-card">
+                  <div class="error-card-icon">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                      <path d="M12 9v4m0 4h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                      <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+                    </svg>
+                  </div>
+                  <div class="error-card-body">
+                    <div class="error-card-title">处理出现问题</div>
+                    <div class="error-card-msg">{{ message.errorMessage }}</div>
+                  </div>
+                </div>
+
+                <!-- 正文内容 -->
+                <div v-if="message.content" class="assistant-text">
                   <template v-for="(part, idx) in parseContent(message.content)" :key="idx">
                     <div v-if="part.type === 'text'" class="text-part" v-html="part.html"></div>
                     <div v-else class="code-block">
@@ -599,16 +698,58 @@ const copyCode = async (code) => {
                     </div>
                   </template>
                 </div>
+
+                <!-- 工具调用卡片 -->
+                <div v-for="(tc, tcIdx) in (message.toolCalls || [])" :key="tcIdx" class="tool-card">
+                  <div class="tool-card-header" @click="toggleToolCollapse(tc)">
+                    <div class="tool-card-icon">
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                        <path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+                      </svg>
+                    </div>
+                    <span class="tool-card-name">{{ tc.tool.toUpperCase() }}</span>
+                    <span class="tool-card-status">已完成</span>
+                    <svg :class="['tool-card-chevron', { expanded: !tc.collapsed }]" width="16" height="16" viewBox="0 0 24 24" fill="none">
+                      <path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                  </div>
+                  <div v-if="!tc.collapsed" class="tool-card-body">
+                    <div class="tool-section">
+                      <div class="tool-section-label">调用参数</div>
+                      <pre class="tool-json"><code>{{ JSON.stringify(tc.payload, null, 2) }}</code></pre>
+                    </div>
+                    <div class="tool-section">
+                      <div class="tool-section-label">执行结果</div>
+                      <pre class="tool-json"><code>{{ JSON.stringify(tc.result, null, 2) }}</code></pre>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Done 摘要栏 -->
+                <div v-if="message.doneData && message.content" class="done-bar">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                    <circle cx="12" cy="12" r="9" fill="#10b981" stroke="#10b981" stroke-width="2"/>
+                    <path d="M8 12l2.5 3L16 9" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                  <span>任务完成</span>
+                  <span v-if="message.doneData.taskRoute" class="done-route">{{ message.doneData.taskRoute }}</span>
+                </div>
+
               </div>
             </template>
           </div>
           
+          <!-- 全局 Loading -->
           <div v-if="isLoading" class="message assistant">
             <div class="message-avatar">
               <div class="avatar ai-avatar">AI</div>
             </div>
             <div class="message-content">
-              <span class="loading-dots">思考中</span>
+              <div class="loading-skeleton">
+                <div class="skeleton-line long"></div>
+                <div class="skeleton-line medium"></div>
+                <div class="skeleton-line short"></div>
+              </div>
             </div>
           </div>
         </div>
@@ -641,7 +782,7 @@ const copyCode = async (code) => {
 </template>
 
 <style scoped>
-/* 整体布局 */
+/* ============= 布局 ============= */
 .chat-layout {
   display: flex;
   width: 100%;
@@ -650,7 +791,7 @@ const copyCode = async (code) => {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
 }
 
-/* 左侧边栏 */
+/* ============= 侧边栏 ============= */
 .sidebar {
   width: 280px;
   background: #1a1a1a;
@@ -833,7 +974,7 @@ const copyCode = async (code) => {
   color: #b8b8b8;
 }
 
-/* 右侧主内容区 */
+/* ============= 主内容区 ============= */
 .main-content {
   flex: 1;
   display: flex;
@@ -841,19 +982,22 @@ const copyCode = async (code) => {
   background: white;
 }
 
-/* 消息区域 */
 .messages-container {
   flex: 1;
   overflow-y: auto;
   padding: 40px 20px;
 }
 
-/* 空状态 */
+/* ============= 空状态 ============= */
 .empty-state {
   max-width: 800px;
   margin: 0 auto;
   text-align: center;
   padding: 100px 20px;
+}
+
+.empty-icon {
+  margin-bottom: 20px;
 }
 
 .empty-state h1 {
@@ -869,7 +1013,7 @@ const copyCode = async (code) => {
   margin: 0;
 }
 
-/* 消息 */
+/* ============= 消息 ============= */
 .message {
   width: 100%;
   margin: 0 0 32px 0;
@@ -902,29 +1046,18 @@ const copyCode = async (code) => {
   font-weight: 600;
 }
 
-.user-avatar {
-  background: #6b72ff;
-  color: white;
-}
-
 .ai-avatar {
-  background: #f0f0f0;
-  color: #1a1a1a;
+  background: linear-gradient(135deg, #e8eaff, #d4d8ff);
+  color: #4f46e5;
 }
 
 .message-content {
   flex: 1;
   max-width: 85%;
   padding-top: 8px;
-}
-
-.user-text,
-.assistant-text {
-  font-size: 15px;
-  line-height: 1.7;
-  color: #1a1a1a;
-  white-space: pre-wrap;
-  word-wrap: break-word;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
 .user-text {
@@ -933,6 +1066,7 @@ const copyCode = async (code) => {
   border-radius: 16px;
   border-bottom-right-radius: 4px;
   max-width: 700px;
+  font-size: 15px;
   line-height: 1.6;
   color: #1a1a1a;
   white-space: pre-wrap;
@@ -941,107 +1075,385 @@ const copyCode = async (code) => {
 
 .assistant-text {
   width: 100%;
-  max-width: none;
+  font-size: 15px;
+  line-height: 1.7;
+  color: #1a1a1a;
+  word-wrap: break-word;
 }
 
-.plan-card {
-  width: 100%;
-  background: #f8fafc;
-  border: 1px solid #e2e8f0;
-  border-radius: 14px;
-  padding: 16px;
-  margin-bottom: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.thinking-status {
-  padding: 8px 0;
-  margin-bottom: 8px;
-}
-
-.thinking-indicator {
-  color: #6366f1;
-  font-size: 14px;
-  font-weight: 500;
-}
-
-.thinking-indicator::after {
-  content: '...';
-  animation: dots 1.5s steps(4, end) infinite;
-}
-
-.plan-card-title {
-  font-size: 16px;
-  font-weight: 600;
-  color: #0f172a;
-}
-
-.plan-card-subtitle {
-  font-size: 12px;
-  color: #64748b;
+/* ============= Thinking 卡片 ============= */
+.thinking-card {
   display: flex;
   align-items: center;
-  gap: 6px;
-}
-
-.plan-card-dot {
-  font-size: 10px;
-}
-
-.plan-card-objective {
-  color: #334155;
+  gap: 10px;
+  padding: 8px 14px;
+  background: linear-gradient(135deg, #f0f1ff, #eef0ff);
+  border: 1px solid #d4d8ff;
+  border-radius: 10px;
+  animation: fadeIn 0.3s ease;
   font-size: 13px;
+  max-width: 420px;
 }
 
-.plan-steps {
+.thinking-pulse {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #6366f1;
+  flex-shrink: 0;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.thinking-body {
+  flex: 1;
+}
+
+.thinking-label {
+  font-size: 14px;
+  font-weight: 500;
+  color: #4338ca;
+}
+
+/* ============= Plan 卡片 ============= */
+.plan-card {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 12px 14px;
   display: flex;
   flex-direction: column;
   gap: 8px;
+  max-width: 420px;
 }
 
-.plan-step {
+.plan-card-header {
   display: flex;
-  gap: 10px;
-  align-items: flex-start;
-  background: #fff;
-  border: 1px solid #e2e8f0;
-  border-radius: 12px;
-  padding: 10px 12px;
+  align-items: center;
+  gap: 8px;
 }
 
-.plan-step-index {
-  width: 24px;
-  height: 24px;
-  border-radius: 8px;
-  background: #6366f1;
-  color: #fff;
-  font-size: 12px;
+.plan-card-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  background: linear-gradient(135deg, #6366f1, #818cf8);
+  color: white;
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
 }
 
-.plan-step-body {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+.plan-card-icon svg { width: 14px; height: 14px; }
+
+.plan-card-titles {
+  flex: 1;
 }
 
-.plan-step-name {
+.plan-card-title {
   font-size: 13px;
   font-weight: 600;
   color: #0f172a;
 }
 
-.plan-step-meta {
-  font-size: 12px;
+.plan-card-subtitle {
+  font-size: 11px;
   color: #64748b;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 1px;
 }
 
-/* 代码块样式 - 浅色主题 */
+.route-tag {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+.tag-auto { background: #dbeafe; color: #1d4ed8; }
+.tag-qa { background: #f0fdf4; color: #15803d; }
+.tag-eval { background: #fef3c7; color: #a16207; }
+.tag-spi { background: #fce7f3; color: #be185d; }
+.tag-config { background: #e0e7ff; color: #4338ca; }
+.tag-default { background: #f1f5f9; color: #475569; }
+
+.plan-scenario {
+  color: #94a3b8;
+}
+
+.plan-card-objective {
+  color: #475569;
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 0 2px;
+}
+
+.plan-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.plan-step {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  transition: all 0.3s ease;
+}
+
+.plan-step.step-running {
+  border-color: #818cf8;
+  background: #fafaff;
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.1);
+}
+
+.plan-step.step-done {
+  border-color: #86efac;
+  background: #f0fdf4;
+}
+
+.plan-step-status {
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.plan-step-status svg { width: 14px; height: 14px; }
+
+.status-pending { color: #cbd5e1; }
+.status-running { color: #6366f1; }
+.status-done { color: #10b981; }
+
+.step-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid #e0e7ff;
+  border-top-color: #6366f1;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+.plan-step-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.plan-step-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.plan-step-meta {
+  font-size: 11px;
+  color: #94a3b8;
+  margin-top: 1px;
+  line-height: 1.4;
+}
+
+.plan-step-no {
+  font-size: 10px;
+  color: #cbd5e1;
+  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.plan-progress {
+  height: 4px;
+  background: #e2e8f0;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.plan-progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #6366f1, #10b981);
+  border-radius: 2px;
+  transition: width 0.5s ease;
+}
+
+/* ============= Error 卡片 ============= */
+.error-card {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 14px 16px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 12px;
+}
+
+.error-card-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: #fee2e2;
+  color: #dc2626;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.error-card-body {
+  flex: 1;
+}
+
+.error-card-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #991b1b;
+  margin-bottom: 4px;
+}
+
+.error-card-msg {
+  font-size: 13px;
+  color: #b91c1c;
+  line-height: 1.5;
+}
+
+/* ============= Tool Call 卡片 ============= */
+.tool-card {
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #f8fafc;
+}
+
+.tool-card-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.2s;
+}
+
+.tool-card-header:hover {
+  background: #f1f5f9;
+}
+
+.tool-card-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: #e0e7ff;
+  color: #4338ca;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.tool-card-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.tool-card-status {
+  font-size: 12px;
+  color: #10b981;
+  font-weight: 500;
+  margin-left: auto;
+}
+
+.tool-card-chevron {
+  color: #94a3b8;
+  transition: transform 0.2s;
+  flex-shrink: 0;
+}
+
+.tool-card-chevron.expanded {
+  transform: rotate(180deg);
+}
+
+.tool-card-body {
+  border-top: 1px solid #e2e8f0;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  animation: slideDown 0.2s ease;
+}
+
+.tool-section-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+}
+
+.tool-json {
+  margin: 0;
+  padding: 12px;
+  background: #f1f5f9;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #334155;
+}
+
+/* ============= Done 摘要栏 ============= */
+.done-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #15803d;
+  font-weight: 500;
+}
+
+.done-route {
+  margin-left: auto;
+  font-size: 12px;
+  padding: 2px 8px;
+  background: #dcfce7;
+  border-radius: 4px;
+  color: #166534;
+}
+
+/* ============= Loading 骨架屏 ============= */
+.loading-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 0;
+}
+
+.skeleton-line {
+  height: 14px;
+  background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
+  background-size: 200% 100%;
+  border-radius: 6px;
+  animation: shimmer 1.5s ease-in-out infinite;
+}
+
+.skeleton-line.long { width: 80%; }
+.skeleton-line.medium { width: 60%; }
+.skeleton-line.short { width: 40%; }
+
+/* ============= 代码块 ============= */
 .code-block {
   margin: 16px 0;
   border-radius: 8px;
@@ -1106,53 +1518,28 @@ const copyCode = async (code) => {
   display: block;
 }
 
+/* ============= Markdown 文本 ============= */
 .text-part {
   margin: 8px 0;
   line-height: 1.8;
   color: #1a1a1a;
 }
 
-.text-part :deep(p) {
-  margin: 0 0 10px;
-}
-
-.text-part :deep(h1),
-.text-part :deep(h2),
-.text-part :deep(h3),
+.text-part :deep(p) { margin: 0 0 10px; }
+.text-part :deep(h1) { margin: 18px 0 10px; color: #0f172a; font-weight: 700; font-size: 20px; }
+.text-part :deep(h2) { margin: 16px 0 8px; color: #0f172a; font-weight: 700; font-size: 17px; }
+.text-part :deep(h3) { margin: 14px 0 8px; color: #0f172a; font-weight: 600; font-size: 15px; }
 .text-part :deep(h4),
 .text-part :deep(h5),
-.text-part :deep(h6) {
-  margin: 16px 0 10px;
-  color: #0f172a;
-  font-weight: 600;
-}
-
-.text-part :deep(ul) {
-  margin: 8px 0 12px 22px;
-  padding: 0;
-}
-
-.text-part :deep(li) {
-  margin: 4px 0;
-}
-
-.text-part :deep(strong) {
-  font-weight: 700;
-}
-
-.text-part :deep(em) {
-  font-style: italic;
-}
-
-.text-part :deep(a) {
-  color: #4f46e5;
-  text-decoration: none;
-}
-
-.text-part :deep(a:hover) {
-  text-decoration: underline;
-}
-
+.text-part :deep(h6) { margin: 12px 0 6px; color: #0f172a; font-weight: 600; font-size: 14px; }
+.text-part :deep(ul),
+.text-part :deep(ol) { margin: 8px 0 12px 22px; padding: 0; }
+.text-part :deep(li) { margin: 4px 0; }
+.text-part :deep(hr) { border: none; border-top: 1px solid #e2e8f0; margin: 16px 0; }
+.text-part :deep(strong) { font-weight: 700; }
+.text-part :deep(em) { font-style: italic; }
+.text-part :deep(a) { color: #4f46e5; text-decoration: none; }
+.text-part :deep(a:hover) { text-decoration: underline; }
 .text-part :deep(code) {
   font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
   font-size: 13px;
@@ -1161,36 +1548,13 @@ const copyCode = async (code) => {
   padding: 2px 6px;
   border-radius: 4px;
 }
-
-.text-part :deep(.markdown-table-wrapper) {
-  width: 100%;
-  overflow-x: auto;
-  margin: 10px 0 14px;
-}
-
-.text-part :deep(table) {
-  width: 100%;
-  border-collapse: collapse;
-  border: 1px solid #dfe3ea;
-  font-size: 14px;
-  background: #fff;
-}
-
+.text-part :deep(.markdown-table-wrapper) { width: 100%; overflow-x: auto; margin: 10px 0 14px; }
+.text-part :deep(table) { width: 100%; border-collapse: collapse; border: 1px solid #dfe3ea; font-size: 14px; background: #fff; }
 .text-part :deep(th),
-.text-part :deep(td) {
-  border: 1px solid #dfe3ea;
-  padding: 8px 10px;
-  text-align: left;
-  vertical-align: top;
-}
+.text-part :deep(td) { border: 1px solid #dfe3ea; padding: 8px 10px; text-align: left; vertical-align: top; }
+.text-part :deep(th) { background: #f8fafc; color: #0f172a; font-weight: 600; }
 
-.text-part :deep(th) {
-  background: #f8fafc;
-  color: #0f172a;
-  font-weight: 600;
-}
-
-/* 输入区域 */
+/* ============= 输入区域 ============= */
 .input-area {
   border-top: 1px solid #e5e5e5;
   background: white;
@@ -1231,17 +1595,9 @@ const copyCode = async (code) => {
   color: #1a1a1a;
 }
 
-.input-container textarea:focus {
-  outline: none;
-}
-
-.input-container textarea::placeholder {
-  color: #999;
-}
-
-.input-container textarea:disabled {
-  opacity: 0.6;
-}
+.input-container textarea:focus { outline: none; }
+.input-container textarea::placeholder { color: #999; }
+.input-container textarea:disabled { opacity: 0.6; }
 
 .send-btn {
   display: flex;
@@ -1259,15 +1615,8 @@ const copyCode = async (code) => {
   flex-shrink: 0;
 }
 
-.send-btn:hover:not(:disabled) {
-  background: #5460e6;
-}
-
-.send-btn:disabled {
-  background: #e0e0e0;
-  cursor: not-allowed;
-  opacity: 0.6;
-}
+.send-btn:hover:not(:disabled) { background: #5460e6; }
+.send-btn:disabled { background: #e0e0e0; cursor: not-allowed; opacity: 0.6; }
 
 .input-hint {
   text-align: center;
@@ -1276,71 +1625,42 @@ const copyCode = async (code) => {
   margin: 12px 0 0;
 }
 
-.loading-dots::after {
-  content: '...';
-  animation: dots 1.5s steps(4, end) infinite;
+/* ============= 动画 ============= */
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(0.85); }
 }
 
-@keyframes dots {
-  0%, 20% { content: '.'; }
-  40% { content: '..'; }
-  60%, 100% { content: '...'; }
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
 }
 
 @keyframes fadeIn {
-  from {
-    opacity: 0;
-    transform: translateY(10px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
-/* 滚动条美化 */
+@keyframes slideDown {
+  from { opacity: 0; max-height: 0; }
+  to { opacity: 1; max-height: 600px; }
+}
+
+/* ============= 滚动条 ============= */
 .messages-container::-webkit-scrollbar,
-.sidebar-content::-webkit-scrollbar {
-  width: 4px;
-}
-
+.sidebar-content::-webkit-scrollbar { width: 4px; }
 .messages-container::-webkit-scrollbar-track,
-.sidebar-content::-webkit-scrollbar-track {
-  background: rgba(15, 23, 42, 0.04);
-  border-radius: 10px;
-}
-
-.sidebar-content::-webkit-scrollbar-track {
-  background: rgba(255, 255, 255, 0.06);
-}
-
-.chat-history-list::-webkit-scrollbar-track {
-  background: rgba(255, 255, 255, 0.02);
-}
-
-.messages-container::-webkit-scrollbar-thumb {
-  background: rgba(0, 0, 0, 0.18);
-  border-radius: 10px;
-}
-
-.sidebar-content::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.18);
-  border-radius: 10px;
-}
-
-.chat-history-list::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.12);
-}
-
-.messages-container::-webkit-scrollbar-thumb:hover {
-  background: rgba(0, 0, 0, 0.32);
-}
-
-.sidebar-content::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.32);
-}
-
-.chat-history-list::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.2);
-}
+.sidebar-content::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.04); border-radius: 10px; }
+.sidebar-content::-webkit-scrollbar-track { background: rgba(255, 255, 255, 0.06); }
+.chat-history-list::-webkit-scrollbar-track { background: rgba(255, 255, 255, 0.02); }
+.messages-container::-webkit-scrollbar-thumb { background: rgba(0, 0, 0, 0.18); border-radius: 10px; }
+.sidebar-content::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.18); border-radius: 10px; }
+.chat-history-list::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); }
+.messages-container::-webkit-scrollbar-thumb:hover { background: rgba(0, 0, 0, 0.32); }
+.sidebar-content::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.32); }
+.chat-history-list::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.2); }
 </style>

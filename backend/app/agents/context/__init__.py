@@ -1,5 +1,7 @@
-"""Agent上下文系统 - Prompt加载、业务上下文构建"""
+"""Agent上下文系统 — AgentContext 数据模型、ContextBuilder、Prompt 加载"""
 
+from backend.app.agents.context.model import AgentContext, Message
+from backend.app.agents.context.builder import ContextBuilder
 from backend.app.agents.context.loader import (
     read_prompt_file,
     load_plan_system_prompts,
@@ -8,6 +10,9 @@ from backend.app.agents.context.loader import (
 )
 
 __all__ = [
+    "AgentContext",
+    "Message",
+    "ContextBuilder",
     "read_prompt_file",
     "load_plan_system_prompts",
     "build_business_catalog",
